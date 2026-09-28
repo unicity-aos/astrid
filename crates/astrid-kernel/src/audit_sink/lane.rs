@@ -28,14 +28,13 @@ use astrid_core::{PrincipalId, SessionId, Timestamp};
 use astrid_crypto::ContentHash;
 
 use super::MANIFEST_GATED_REASON;
+use super::marker::GapDuty;
 
 /// Authorization reason on entries the lane writes about itself (loss and
 /// gap records).
 const LANE_ACCOUNTING_REASON: &str = "host-audit lane accounting";
 /// Loss reason for calls that met a full queue.
 pub(super) const QUEUE_FULL: &str = "queue_full";
-/// Gap reason for a lane run that stopped without draining.
-pub(super) const UNCLEAN_SHUTDOWN: &str = "unclean_shutdown";
 
 /// One host call, as a single-call entry would record it.
 pub(super) struct Call {
@@ -264,8 +263,12 @@ pub(super) enum SlotKind {
         action: AuditAction,
         ticket: Arc<AdmitTicket>,
     },
-    /// A previous lane run stopped without draining.
-    Gap { epoch: String, opened_at: Timestamp },
+    /// A previous lane run may have lost calls; see [`GapDuty`].
+    Gap {
+        epoch: String,
+        opened_at: Timestamp,
+        reason: String,
+    },
 }
 
 /// One future entry on a principal's chain.
@@ -319,7 +322,11 @@ impl Slot {
                 manifest_gated(),
                 AuditOutcome::success_with("write-ahead"),
             ),
-            SlotKind::Gap { epoch, opened_at } => gap_entry(epoch, *opened_at),
+            SlotKind::Gap {
+                epoch,
+                opened_at,
+                reason,
+            } => gap_entry(epoch, *opened_at, reason),
         };
         (
             session.clone(),
@@ -368,19 +375,22 @@ fn run_entry(key: RunKey, calls: &Summary) -> (AuditAction, AuthorizationProof, 
     }
 }
 
-/// The gap entry for a lane run that stopped without draining.
+/// The gap entry for a lane run that may have lost calls.
 pub(super) fn gap_entry(
     epoch: &str,
     opened_at: Timestamp,
+    reason: &str,
 ) -> (AuditAction, AuthorizationProof, AuditOutcome) {
     (
         AuditAction::HostCallGap {
             epoch: epoch.to_owned(),
             opened_at,
-            reason: UNCLEAN_SHUTDOWN.to_owned(),
+            reason: reason.to_owned(),
         },
         lane_accounting(),
-        AuditOutcome::failure(format!("host-audit lane {epoch} stopped without draining")),
+        AuditOutcome::failure(format!(
+            "host calls of host-audit lane {epoch} may be missing: {reason}"
+        )),
     )
 }
 
@@ -551,19 +561,17 @@ impl Lanes {
     }
 
     /// Put a gap slot in front of everything queued for `principal`.
-    pub(super) fn push_gap_front(
-        &mut self,
-        principal: &PrincipalId,
-        epoch: String,
-        opened_at: Timestamp,
-        now: Instant,
-    ) {
+    pub(super) fn push_gap_front(&mut self, principal: &PrincipalId, duty: &GapDuty, now: Instant) {
         self.queued_slots = self.queued_slots.saturating_add(1);
         self.pending_since.get_or_insert(now);
         self.lane_mut(principal).fifo.push_front(Slot {
             order: 0,
             principal: principal.clone(),
-            kind: SlotKind::Gap { epoch, opened_at },
+            kind: SlotKind::Gap {
+                epoch: duty.epoch.clone(),
+                opened_at: duty.opened_at,
+                reason: duty.reason.clone(),
+            },
         });
     }
 

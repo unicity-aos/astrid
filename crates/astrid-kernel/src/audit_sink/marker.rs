@@ -10,7 +10,9 @@
 //! gap entry in every chain the run registered, and one in the session's
 //! system chain, which covers chains that were touched but not yet
 //! registered. Duties stay in the marker until their entries are durable, so
-//! a second crash does not lose them.
+//! a second crash does not lose them. A marker that cannot be parsed says
+//! nothing about the previous run, so it is treated as an unclean stop of an
+//! unknown run and replaced.
 
 use astrid_core::{PrincipalId, Timestamp};
 use astrid_storage::ScopedKvStore;
@@ -18,13 +20,23 @@ use serde::{Deserialize, Serialize};
 
 const MARKER_KEY: &str = "lane";
 const MARKER_VERSION: u32 = 1;
+/// Gap reason for a lane run that stopped without draining.
+pub(super) const UNCLEAN_SHUTDOWN: &str = "unclean_shutdown";
+/// Gap reason when the previous run's marker could not be parsed.
+pub(super) const MARKER_UNREADABLE: &str = "lane_marker_unreadable";
 
-/// A lane run that stopped without draining, and the chains it wrote to.
+fn unclean_shutdown() -> String {
+    UNCLEAN_SHUTDOWN.to_owned()
+}
+
+/// A lane run that may have lost calls, and the chains it wrote to.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct GapDuty {
     pub(super) epoch: String,
     pub(super) opened_at: Timestamp,
     pub(super) chains: Vec<String>,
+    #[serde(default = "unclean_shutdown")]
+    pub(super) reason: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -56,22 +68,36 @@ impl LaneMarker {
         epoch: String,
         opened_at: Timestamp,
     ) -> Result<(Self, Vec<GapDuty>), String> {
-        let previous = runtime
+        let stored = runtime
             .block_on(store.get(MARKER_KEY))
-            .map_err(|error| format!("read host-audit lane marker: {error}"))?
-            .map(|bytes| serde_json::from_slice::<MarkerState>(&bytes))
-            .transpose()
-            .map_err(|error| format!("parse host-audit lane marker: {error}"))?;
+            .map_err(|error| format!("read host-audit lane marker: {error}"))?;
         let mut duties = Vec::new();
-        if let Some(previous) = previous {
-            duties.extend(previous.pending_gaps);
-            if !previous.closed {
+        match stored.map(|bytes| serde_json::from_slice::<MarkerState>(&bytes)) {
+            None => {},
+            Some(Ok(previous)) => {
+                duties.extend(previous.pending_gaps);
+                if !previous.closed {
+                    duties.push(GapDuty {
+                        epoch: previous.epoch,
+                        opened_at: previous.opened_at,
+                        chains: previous.chains,
+                        reason: unclean_shutdown(),
+                    });
+                }
+            },
+            Some(Err(error)) => {
+                tracing::warn!(
+                    security_event = true,
+                    %error,
+                    "host-audit lane marker unreadable; recording a gap for the unknown previous run"
+                );
                 duties.push(GapDuty {
-                    epoch: previous.epoch,
-                    opened_at: previous.opened_at,
-                    chains: previous.chains,
+                    epoch: "unknown".to_owned(),
+                    opened_at,
+                    chains: Vec::new(),
+                    reason: MARKER_UNREADABLE.to_owned(),
                 });
-            }
+            },
         }
         let marker = Self {
             store,

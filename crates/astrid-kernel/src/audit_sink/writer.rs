@@ -105,6 +105,7 @@ struct Writer<'a> {
 /// Writer thread body.
 pub(super) fn run(shared: &Shared, config: &WriterConfig) {
     shared.health().worker_alive = true;
+    let _stop = StopOnExit(shared);
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -112,7 +113,6 @@ pub(super) fn run(shared: &Shared, config: &WriterConfig) {
         Ok(runtime) => runtime,
         Err(error) => {
             shared.note_error(format!("failed to create audit writer runtime: {error}"));
-            stop(shared, "audit writer runtime unavailable");
             return;
         },
     };
@@ -142,7 +142,21 @@ pub(super) fn run(shared: &Shared, config: &WriterConfig) {
     if drained && !abandoned {
         writer.close_marker();
     }
-    stop(shared, "audit writer stopped");
+}
+
+/// Closes the lane however the writer exits, a panic included, so producers
+/// see a closed lane, waiting admissions are refused, and health shows the
+/// writer as stopped. The lane marker stays open unless the writer closed it
+/// after a full drain, so the next start records a gap.
+struct StopOnExit<'a>(&'a Shared);
+
+impl Drop for StopOnExit<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.note_error("host-audit writer panicked".to_owned());
+        }
+        stop(self.0, "audit writer stopped");
+    }
 }
 
 /// Refuse further calls and fail every waiting admission.
@@ -190,7 +204,7 @@ impl Writer<'_> {
                 let Ok(principal) = PrincipalId::new(chain.as_str()) else {
                     continue;
                 };
-                lanes.push_gap_front(&principal, duty.epoch.clone(), duty.opened_at, now);
+                lanes.push_gap_front(&principal, duty, now);
                 self.gaps.chain_entries = self.gaps.chain_entries.saturating_add(1);
             }
         }
@@ -270,7 +284,8 @@ impl Writer<'_> {
 
     fn record_system_gaps(&mut self) {
         while let Some(duty) = self.gaps.system.first() {
-            let (action, authorization, outcome) = gap_entry(&duty.epoch, duty.opened_at);
+            let (action, authorization, outcome) =
+                gap_entry(&duty.epoch, duty.opened_at, &duty.reason);
             let appended = self.runtime.block_on(self.config.audit_log.append(
                 self.config.session.clone(),
                 action,

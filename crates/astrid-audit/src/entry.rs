@@ -499,15 +499,17 @@ pub enum AuditAction {
         reason: String,
     },
 
-    /// A previous run of the host-audit lane stopped without draining its
-    /// queue. Host calls of this chain that it had accepted after its last
-    /// entry here may be missing; their number is unknown.
+    /// A previous run of the host-audit lane may have lost calls: it stopped
+    /// without draining its queue, or its state could not be read. Host calls
+    /// of this chain that it had accepted after its last entry here may be
+    /// missing; their number is unknown.
     HostCallGap {
-        /// Identifier of the lane run that stopped.
+        /// Identifier of the lane run, or `unknown`.
         epoch: String,
-        /// When that lane run started.
+        /// When that lane run started (when unknown, when the gap was found).
         opened_at: Timestamp,
-        /// Why the gap is recorded (`unclean_shutdown`).
+        /// Why the gap is recorded (`unclean_shutdown`,
+        /// `lane_marker_unreadable`).
         reason: String,
     },
 

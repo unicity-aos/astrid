@@ -184,7 +184,16 @@ fn gap_slot_precedes_everything_queued_for_its_chain() {
     let mut lanes = Lanes::new(8, true);
     let a = alice();
     lanes.push_call(&a, read("/early", HostCallOutcome::Ok), now);
-    lanes.push_gap_front(&a, "run-1".into(), Timestamp::now(), now);
+    lanes.push_gap_front(
+        &a,
+        &GapDuty {
+            epoch: "run-1".into(),
+            opened_at: Timestamp::now(),
+            chains: vec!["alice".into()],
+            reason: "unclean_shutdown".into(),
+        },
+        now,
+    );
     assert_eq!(
         lanes.take_unregistered(),
         std::slice::from_ref(&a),

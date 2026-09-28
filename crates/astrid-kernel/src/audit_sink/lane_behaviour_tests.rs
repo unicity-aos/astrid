@@ -188,6 +188,118 @@ async fn unclean_stop_is_recorded_as_a_gap_at_next_start() {
     );
 }
 
+/// A marker that cannot be parsed says nothing about the previous run: it is
+/// recorded as a gap of an unknown run in the system chain and replaced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unreadable_marker_is_recorded_as_a_gap_and_replaced() {
+    let log = Arc::new(AuditLog::in_memory(KeyPair::generate()));
+    let session = SessionId::from_uuid(uuid::Uuid::from_u128(0x09b6));
+    let marker = marker_store();
+    marker
+        .set("lane", b"not a marker".to_vec())
+        .await
+        .expect("corrupt marker");
+
+    let first = KernelAuditSink::with_lane_marker(
+        Arc::clone(&log),
+        session.clone(),
+        policy(10, 128, 4096),
+        marker.clone(),
+    );
+    first.shutdown();
+    assert_eq!(first.health().gaps_recorded, 1);
+    let system = log
+        .get_principal_entries(&session, None)
+        .await
+        .expect("system entries");
+    assert!(
+        matches!(
+            &system[..],
+            [entry] if matches!(
+                &entry.action,
+                AuditAction::HostCallGap { epoch, reason, .. }
+                    if epoch == "unknown" && reason == "lane_marker_unreadable"
+            )
+        ),
+        "{system:?}"
+    );
+
+    let second = KernelAuditSink::with_lane_marker(
+        Arc::clone(&log),
+        session.clone(),
+        policy(10, 128, 4096),
+        marker,
+    );
+    second.shutdown();
+    assert_eq!(second.health().gaps_recorded, 0, "the marker was replaced");
+}
+
+/// A batch the log refuses is kept and retried, in order and without loss,
+/// until the log accepts it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_batch_is_retried_in_order_once_the_log_recovers() {
+    let log = Arc::new(AuditLog::in_memory(KeyPair::generate()));
+    let session = SessionId::from_uuid(uuid::Uuid::from_u128(0x09b7));
+    let p = principal();
+    log.set_global_retention_caps(1, u64::MAX)
+        .await
+        .expect("caps");
+    log.append_with_principal(
+        session.clone(),
+        p.clone(),
+        AuditAction::FileRead {
+            path: "/fills-the-log".into(),
+        },
+        AuthorizationProof::System {
+            reason: "test".into(),
+        },
+        AuditOutcome::success(),
+    )
+    .await
+    .expect("first entry");
+    let sink =
+        KernelAuditSink::with_policy(Arc::clone(&log), session.clone(), policy(10, 128, 4096));
+    for index in 0..3 {
+        let path = format!("/retry-{index}");
+        sink.record(
+            &p,
+            HostAuditEvent::FileRead { path: &path },
+            HostAuditOutcome::Denied("not in host_fs allowlist"),
+        );
+    }
+    let deadline = std::time::Instant::now()
+        .checked_add(std::time::Duration::from_secs(10))
+        .expect("deadline");
+    while sink.health().failed == 0 {
+        assert!(std::time::Instant::now() < deadline, "no failed attempt");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(sink.health().persisted, 0);
+    log.set_global_retention_caps(1_000, u64::MAX)
+        .await
+        .expect("raise caps");
+    wait_persisted(&sink, 3);
+    sink.shutdown();
+
+    let paths: Vec<_> = log
+        .get_principal_entries(&session, Some(&p))
+        .await
+        .expect("entries")
+        .into_iter()
+        .map(|entry| match entry.action {
+            AuditAction::FileRead { path } => path,
+            other => panic!("unexpected action {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        paths,
+        ["/fills-the-log", "/retry-0", "/retry-1", "/retry-2"]
+    );
+    let health = sink.health();
+    assert_eq!((health.lost, health.queue_depth), (0, 0));
+    assert!(log.verify_chain(&session).await.expect("verify").valid);
+}
+
 /// Gap duties survive a second unclean stop before they were recorded.
 #[test]
 fn unrecorded_gap_duties_carry_over_to_the_next_run() {
