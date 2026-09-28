@@ -10,6 +10,7 @@ use astrid_crypto::{ContentHash, KeyPair, PublicKey, Signature};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{AuditError, AuditResult};
+use crate::host_call::HostCallSummary;
 
 /// A single audit log entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -478,6 +479,45 @@ pub enum AuditAction {
         /// Host-observed remote peer endpoint.
         peer_addr: String,
     },
+
+    /// Consecutive capsule host calls of one principal, recorded as one
+    /// entry by the kernel's host-audit lane. The summary counts every call,
+    /// keeps the first call of each class and outcome, and commits to all
+    /// calls in order through its fold (see [`crate::host_call`]).
+    HostCallRun {
+        /// The calls this entry records.
+        calls: HostCallSummary,
+    },
+
+    /// Capsule host calls the host-audit lane accepted but could not record
+    /// individually, for example because its queue was full. The summary
+    /// still counts every lost call and commits to them through its fold.
+    HostCallLoss {
+        /// The calls this entry accounts for.
+        calls: HostCallSummary,
+        /// Why the calls were not recorded individually (`queue_full`).
+        reason: String,
+    },
+
+    /// A previous run of the host-audit lane stopped without draining its
+    /// queue. Host calls of this chain that it had accepted after its last
+    /// entry here may be missing; their number is unknown.
+    HostCallGap {
+        /// Identifier of the lane run that stopped.
+        epoch: String,
+        /// When that lane run started.
+        opened_at: Timestamp,
+        /// Why the gap is recorded (`unclean_shutdown`).
+        reason: String,
+    },
+
+    /// Write-ahead record of a host call in a fail-closed class: the call
+    /// passed its security gate and its effect runs only after this entry is
+    /// durable. The call's outcome is recorded by a later entry.
+    HostCallAdmitted {
+        /// The action the call's outcome entry records.
+        call: Box<AuditAction>,
+    },
 }
 
 impl AuditAction {
@@ -512,6 +552,24 @@ impl AuditAction {
             Self::McpSampling { model, .. } => {
                 format!("Sampling request to {model}")
             },
+            _ => return None,
+        };
+        Some(s)
+    }
+
+    /// Describe the host-audit lane records. Returns `None` for every other
+    /// action; kept apart from [`description`](Self::description) for the
+    /// same function-length reason as [`describe_mcp`](Self::describe_mcp).
+    fn describe_host_lane(&self) -> Option<String> {
+        let s = match self {
+            Self::HostCallRun { calls } => format!("Recorded {} host calls", calls.count),
+            Self::HostCallLoss { calls, reason } => {
+                format!("Lost {} host calls ({reason})", calls.count)
+            },
+            Self::HostCallGap { epoch, reason, .. } => {
+                format!("Host-audit gap after lane {epoch} ({reason})")
+            },
+            Self::HostCallAdmitted { call } => format!("Admitted: {}", call.description()),
             _ => return None,
         };
         Some(s)
@@ -560,6 +618,10 @@ impl AuditAction {
             Self::ProcessSpawn { command } => {
                 format!("Spawned process {command}")
             },
+            Self::HostCallRun { .. }
+            | Self::HostCallLoss { .. }
+            | Self::HostCallGap { .. }
+            | Self::HostCallAdmitted { .. } => self.describe_host_lane().unwrap_or_default(),
             Self::CapabilityCreated { resource, .. } => {
                 format!("Created capability for {resource}")
             },
