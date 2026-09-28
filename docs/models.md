@@ -295,6 +295,13 @@ missing; if the run stopped without draining its queue, the next start writes a
 entries take their place in call order among the capsule's other host-call
 entries on the chain.
 
+Recording is best-effort, like the rest of the audit log: if an append attempt
+for the `http_request` entry fails, the request is still sent and the failure
+is logged as a security event. The entry stays queued and is written in its
+place once the log accepts it; if the daemon stops first, the next start's
+`host_call_gap` entry covers it and its number stays missing. The same holds
+for an approval prompt whose `approval_requested` entry cannot be written.
+
 Credentials are redacted before hashing. The redacted values are:
 
 - credential headers (`Authorization`, `Cookie`, `X-Api-Key`, `api-key`,
