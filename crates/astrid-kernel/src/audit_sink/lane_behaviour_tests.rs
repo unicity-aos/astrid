@@ -272,6 +272,64 @@ async fn system_only_gap_is_recorded_without_a_host_call() {
     sink.shutdown();
 }
 
+/// A system-chain gap entry the log refuses at start is retried while the
+/// lane is idle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_system_gap_is_retried_while_idle() {
+    let log = Arc::new(AuditLog::in_memory(KeyPair::generate()));
+    let session = SessionId::from_uuid(uuid::Uuid::from_u128(0x09ba));
+    log.set_global_retention_caps(1, u64::MAX)
+        .await
+        .expect("caps");
+    log.append(
+        session.clone(),
+        AuditAction::FileRead {
+            path: "/fills-the-log".into(),
+        },
+        AuthorizationProof::System {
+            reason: "test".into(),
+        },
+        AuditOutcome::success(),
+    )
+    .await
+    .expect("first entry");
+    let marker = marker_store();
+    marker
+        .set("lane", b"not a marker".to_vec())
+        .await
+        .expect("corrupt marker");
+
+    let sink = KernelAuditSink::with_lane_marker(
+        Arc::clone(&log),
+        session.clone(),
+        policy(10, 128, 4096),
+        marker,
+    );
+    let deadline = std::time::Instant::now()
+        .checked_add(std::time::Duration::from_secs(15))
+        .expect("deadline");
+    while !sink
+        .health()
+        .last_error
+        .is_some_and(|error| error.contains("system-chain gap entry failed"))
+    {
+        assert!(std::time::Instant::now() < deadline, "no failed attempt");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(sink.health().gaps_recorded, 0);
+    log.set_global_retention_caps(1_000, u64::MAX)
+        .await
+        .expect("raise caps");
+    while sink.health().gaps_recorded < 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "gap not retried while idle"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    sink.shutdown();
+}
+
 /// A batch the log refuses is kept and retried, in order and without loss,
 /// until the log accepts it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
