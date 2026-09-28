@@ -27,6 +27,7 @@ fn describe(slot: &Slot) -> String {
     let kind = match &slot.kind {
         SlotKind::Run { .. } => "run",
         SlotKind::Loss { .. } => "loss",
+        SlotKind::Admit { .. } => "admit",
         SlotKind::Gap { .. } => "gap",
     };
     format!("{}:{kind}:{}", slot.principal, slot.calls())
@@ -191,4 +192,71 @@ fn gap_slot_precedes_everything_queued_for_its_chain() {
     );
     let taken: Vec<_> = lanes.take(8, now).iter().map(describe).collect();
     assert_eq!(taken, ["alice:gap:0", "alice:run:1"]);
+}
+
+#[test]
+fn abandoned_admission_is_dropped_before_it_is_written() {
+    let now = Instant::now();
+    let mut lanes = Lanes::new(8, false);
+    let a = alice();
+    let ticket = Arc::new(AdmitTicket::new());
+    assert!(lanes.push_admit(
+        &a,
+        AuditAction::ProcessSpawn {
+            command: "rm".into()
+        },
+        Arc::clone(&ticket),
+        now
+    ));
+    assert!(lanes.urgent());
+    assert!(ticket.wait(Duration::from_millis(1)).is_err(), "times out");
+    // The writer later resolves it: the abandoned state sticks.
+    ticket.resolve(Ok(()));
+    assert!(ticket.wait(Duration::from_millis(1)).is_err());
+    assert!(lanes.take(8, now).is_empty());
+    assert!(!lanes.urgent());
+}
+
+#[test]
+fn admission_resolves_waiter() {
+    let ticket = Arc::new(AdmitTicket::new());
+    let waiter = {
+        let ticket = Arc::clone(&ticket);
+        std::thread::spawn(move || ticket.wait(Duration::from_secs(10)))
+    };
+    ticket.resolve(Ok(()));
+    assert_eq!(waiter.join().expect("waiter"), Ok(()));
+
+    let failed = AdmitTicket::new();
+    failed.resolve(Err("log full".into()));
+    assert_eq!(failed.wait(Duration::from_secs(1)), Err("log full".into()));
+}
+
+#[test]
+fn chain_with_a_waiting_admission_is_taken_first() {
+    let now = Instant::now();
+    let mut lanes = Lanes::new(64, false);
+    let (a, b) = (alice(), bob());
+    for index in 0..4 {
+        lanes.push_call(
+            &b,
+            read(&format!("/b{index}"), HostCallOutcome::Denied),
+            now,
+        );
+    }
+    lanes.push_call(&a, read("/a", HostCallOutcome::Denied), now);
+    lanes.push_admit(
+        &a,
+        AuditAction::ProcessSpawn {
+            command: "rm".into(),
+        },
+        Arc::new(AdmitTicket::new()),
+        now,
+    );
+    lanes.push_call(&a, read("/a-after", HostCallOutcome::Ok), now);
+    let first: Vec<_> = lanes.take(3, now).iter().map(describe).collect();
+    assert_eq!(first, ["alice:run:1", "alice:admit:0", "bob:run:1"]);
+    assert!(!lanes.urgent());
+    let rest: Vec<_> = lanes.take(8, now).iter().map(describe).collect();
+    assert_eq!(rest, ["bob:run:1", "bob:run:1", "bob:run:1", "alice:run:1"]);
 }

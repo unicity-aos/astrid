@@ -1,4 +1,4 @@
-//! Ordering and restart-gap behaviour of the host-audit lane.
+//! Ordering, restart-gap and fail-closed behaviour of the host-audit lane.
 
 use std::sync::atomic::AtomicU64;
 
@@ -216,20 +216,163 @@ fn unrecorded_gap_duties_carry_over_to_the_next_run() {
     assert_eq!(duties[1].chains, ["alice"]);
 }
 
-/// Calls reported after shutdown are counted, not queued.
+fn fail_closed_policy(classes: &[&str]) -> HostAuditPolicy {
+    HostAuditPolicy::from(&AuditConfig {
+        host_coalesce_ms: 60_000,
+        host_fail_closed: classes.iter().map(|class| (*class).to_owned()).collect(),
+        ..AuditConfig::default()
+    })
+}
+
+/// A fail-closed call is admitted only once its write-ahead entry is
+/// durable, behind everything queued before it; other classes are not held.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn calls_after_shutdown_are_counted() {
+async fn fail_closed_call_waits_for_a_durable_write_ahead_entry() {
+    let log = Arc::new(AuditLog::in_memory(KeyPair::generate()));
+    let session = SessionId::from_uuid(uuid::Uuid::from_u128(0x09b3));
+    let sink = KernelAuditSink::with_policy(
+        Arc::clone(&log),
+        session.clone(),
+        fail_closed_policy(&["file_write"]),
+    );
+    let p = principal();
+    sink.record(
+        &p,
+        HostAuditEvent::FileRead { path: "/before" },
+        HostAuditOutcome::Allowed,
+    );
+    sink.admit(&p, HostAuditEvent::FileRead { path: "/not-held" })
+        .expect("best-effort class");
+    assert_eq!(log.count_session(&session).await.expect("count"), 0);
+
+    sink.admit(&p, HostAuditEvent::FileWrite { path: "/held" })
+        .expect("durable admission");
+    let entries = log
+        .get_principal_entries(&session, Some(&p))
+        .await
+        .expect("entries");
+    assert_eq!(
+        entries.len(),
+        2,
+        "the earlier call is written first: {entries:?}"
+    );
+    assert!(matches!(&entries[0].action, AuditAction::FileRead { path } if path == "/before"));
+    assert!(matches!(
+        &entries[1].action,
+        AuditAction::HostCallAdmitted { call }
+            if matches!(call.as_ref(), AuditAction::FileWrite { path, .. } if path == "/held")
+    ));
+
+    sink.record(
+        &p,
+        HostAuditEvent::FileWrite { path: "/held" },
+        HostAuditOutcome::Allowed,
+    );
+    sink.shutdown();
+    let entries = log
+        .get_principal_entries(&session, Some(&p))
+        .await
+        .expect("entries");
+    assert!(matches!(&entries[2].action, AuditAction::FileWrite { path, .. } if path == "/held"));
+    assert!(log.verify_chain(&session).await.expect("verify").valid);
+}
+
+/// When the write-ahead entry cannot be made durable, the call is refused
+/// and the refusal is queued as a denial.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fail_closed_call_is_refused_when_the_log_cannot_record_it() {
+    let log = Arc::new(AuditLog::in_memory(KeyPair::generate()));
+    let session = SessionId::from_uuid(uuid::Uuid::from_u128(0x09b4));
+    let p = principal();
+    // A one-entry retention cap with no sealed segment to prune makes every
+    // further append fail.
+    log.set_global_retention_caps(1, u64::MAX)
+        .await
+        .expect("caps");
+    log.append_with_principal(
+        session.clone(),
+        p.clone(),
+        AuditAction::FileRead {
+            path: "/fills-the-log".into(),
+        },
+        AuthorizationProof::System {
+            reason: "test".into(),
+        },
+        AuditOutcome::success(),
+    )
+    .await
+    .expect("first entry");
+    let sink = KernelAuditSink::with_policy(
+        Arc::clone(&log),
+        session.clone(),
+        fail_closed_policy(&["process_spawn"]),
+    );
+
+    let refusal = sink
+        .admit(&p, HostAuditEvent::ProcessSpawn { command: "rm" })
+        .expect_err("no durable entry, no effect");
+    assert!(refusal.reason().contains("retention cap"), "{refusal}");
+    let health = sink.health();
+    assert_eq!(health.fail_closed_refused, 1);
+    assert!(health.degraded);
+    assert_eq!(health.queue_depth, 1, "the refusal is queued as a denial");
+    sink.shutdown();
+    assert_eq!(log.count_session(&session).await.expect("count"), 1);
+}
+
+/// After shutdown a fail-closed call is refused and a best-effort call is
+/// counted as dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn calls_after_shutdown_are_refused_or_counted() {
     let log = Arc::new(AuditLog::in_memory(KeyPair::generate()));
     let session = SessionId::from_uuid(uuid::Uuid::from_u128(0x09b5));
-    let sink = test_sink(Arc::clone(&log), session);
+    let sink = KernelAuditSink::with_policy(
+        Arc::clone(&log),
+        session,
+        fail_closed_policy(&["net_connect"]),
+    );
     let p = principal();
     sink.shutdown();
+    assert!(
+        sink.admit(
+            &p,
+            HostAuditEvent::NetConnect {
+                host: "example.com",
+                port: 443
+            }
+        )
+        .is_err()
+    );
     sink.record(
         &p,
         HostAuditEvent::FileRead { path: "/late" },
         HostAuditOutcome::Allowed,
     );
     let health = sink.health();
-    assert_eq!(health.dropped_after_shutdown, 1);
-    assert_eq!(health.accepted, 0);
+    assert_eq!(
+        health.dropped_after_shutdown, 2,
+        "the refusal and the late call"
+    );
+    assert_eq!(health.fail_closed_refused, 1);
+}
+
+/// The configuration and the audit records spell host-call classes alike.
+#[test]
+fn fail_closed_classes_match_the_record_classes() {
+    for class in astrid_config::validate::HOST_AUDIT_FAIL_CLOSED_CLASSES {
+        assert!(HOST_CALL_CLASSES.contains(&class), "{class}");
+    }
+    let policy = fail_closed_policy(&astrid_config::validate::HOST_AUDIT_FAIL_CLOSED_CLASSES);
+    for event in [
+        HostAuditEvent::FileRead { path: "/p" },
+        HostAuditEvent::FileWrite { path: "/p" },
+        HostAuditEvent::FileDelete { path: "/p" },
+        HostAuditEvent::NetConnect { host: "h", port: 1 },
+        HostAuditEvent::NetBind { addr: "a" },
+        HostAuditEvent::ProcessSpawn { command: "c" },
+    ] {
+        assert!(policy.fails_closed(&event), "{event:?}");
+    }
+    assert!(!policy.fails_closed(&HostAuditEvent::FileProbe { path: "/p" }));
+    assert!(!HostAuditPolicy::default().fails_closed(&HostAuditEvent::FileWrite { path: "/p" }));
 }

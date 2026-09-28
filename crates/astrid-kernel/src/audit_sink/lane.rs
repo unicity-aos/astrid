@@ -7,7 +7,8 @@
 //!
 //! Consecutive calls fold into the chain's tail slot while it is still
 //! queued: allowed and failed calls of any class share one run, and identical
-//! denials share one run. A different denial or a loss closes the run. Folding needs no queue capacity.
+//! denials share one run. A different denial, a write-ahead admission or a
+//! loss closes the run. Folding needs no queue capacity.
 //!
 //! When the queue is full, a call that cannot fold into the tail slot goes
 //! into a loss slot at the tail of its chain instead. Later calls fold into
@@ -15,7 +16,8 @@
 //! loss slot beyond capacity and memory stays bounded.
 
 use std::collections::{HashMap, VecDeque};
-use std::time::Instant;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use astrid_audit::host_call::{
     HostCallFold, HostCallOutcome, HostCallRef, HostCallSummary, HostCallTally, host_call_class,
@@ -168,12 +170,100 @@ fn lane_accounting() -> AuthorizationProof {
     }
 }
 
+/// Outcome of a write-ahead admission, shared by the waiting host call and
+/// the writer.
+pub(super) struct AdmitTicket {
+    state: Mutex<AdmitState>,
+    resolved: Condvar,
+}
+
+#[derive(Clone)]
+enum AdmitState {
+    Pending,
+    Durable,
+    Failed(String),
+    /// The host call stopped waiting; a slot still queued is dropped.
+    Abandoned,
+}
+
+impl AdmitTicket {
+    pub(super) fn new() -> Self {
+        Self {
+            state: Mutex::new(AdmitState::Pending),
+            resolved: Condvar::new(),
+        }
+    }
+
+    /// Settle a pending admission. A ticket the caller abandoned stays
+    /// abandoned.
+    pub(super) fn resolve(&self, result: Result<(), String>) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if matches!(*state, AdmitState::Pending) {
+            *state = match result {
+                Ok(()) => AdmitState::Durable,
+                Err(error) => AdmitState::Failed(error),
+            };
+            self.resolved.notify_all();
+        }
+    }
+
+    fn is_abandoned(&self) -> bool {
+        matches!(
+            *self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            AdmitState::Abandoned
+        )
+    }
+
+    /// Wait until the writer settles the admission, or give up at `timeout`.
+    pub(super) fn wait(&self, timeout: Duration) -> Result<(), String> {
+        let deadline = Instant::now().checked_add(timeout);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            match &*state {
+                AdmitState::Durable => return Ok(()),
+                AdmitState::Failed(error) => return Err(error.clone()),
+                AdmitState::Abandoned => return Err("admission abandoned".to_owned()),
+                AdmitState::Pending => {},
+            }
+            let remaining = deadline.map_or(Duration::ZERO, |deadline| {
+                deadline.saturating_duration_since(Instant::now())
+            });
+            if remaining.is_zero() {
+                *state = AdmitState::Abandoned;
+                return Err(format!(
+                    "write-ahead entry not durable within {}ms",
+                    timeout.as_millis()
+                ));
+            }
+            state = self
+                .resolved
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+    }
+}
+
 /// What a slot becomes on the chain.
 pub(super) enum SlotKind {
     /// Consecutive calls sharing a run key.
     Run { key: RunKey, calls: Summary },
     /// Calls that met a full queue.
     Loss { calls: Summary },
+    /// Write-ahead entry of a fail-closed call.
+    Admit {
+        action: AuditAction,
+        ticket: Arc<AdmitTicket>,
+    },
     /// A previous lane run stopped without draining.
     Gap { epoch: String, opened_at: Timestamp },
 }
@@ -195,11 +285,15 @@ pub(super) type AppendRequest = (
 );
 
 impl Slot {
+    fn is_admission(&self) -> bool {
+        matches!(self.kind, SlotKind::Admit { .. })
+    }
+
     /// Calls this slot records (run) or accounts for (loss).
     pub(super) fn calls(&self) -> u64 {
         match &self.kind {
             SlotKind::Run { calls, .. } | SlotKind::Loss { calls } => calls.count(),
-            SlotKind::Gap { .. } => 0,
+            SlotKind::Admit { .. } | SlotKind::Gap { .. } => 0,
         }
     }
 
@@ -217,6 +311,13 @@ impl Slot {
                     "{} host calls not recorded individually: {QUEUE_FULL}",
                     calls.count()
                 )),
+            ),
+            SlotKind::Admit { action, .. } => (
+                AuditAction::HostCallAdmitted {
+                    call: Box::new(action.clone()),
+                },
+                manifest_gated(),
+                AuditOutcome::success_with("write-ahead"),
             ),
             SlotKind::Gap { epoch, opened_at } => gap_entry(epoch, *opened_at),
         };
@@ -335,6 +436,8 @@ pub(super) struct Lanes {
     /// lane marker.
     unregistered: Vec<PrincipalId>,
     track_chains: bool,
+    /// Queued write-ahead admissions (host calls blocked on the writer).
+    admissions: usize,
     /// Where the lane run is in its life.
     pub(super) lifecycle: Lifecycle,
     /// Calls offered to the lanes (queued, folded or lost).
@@ -356,6 +459,7 @@ impl Lanes {
             pending_since: None,
             unregistered: Vec::new(),
             track_chains,
+            admissions: 0,
             lifecycle: Lifecycle::Open,
             accepted: 0,
             queued_calls: 0,
@@ -429,6 +533,23 @@ impl Lanes {
         }
     }
 
+    /// Queue a write-ahead admission. Admissions are bounded by concurrent
+    /// host calls, so they may exceed the queue capacity.
+    pub(super) fn push_admit(
+        &mut self,
+        principal: &PrincipalId,
+        action: AuditAction,
+        ticket: Arc<AdmitTicket>,
+        now: Instant,
+    ) -> bool {
+        if self.lifecycle.refuses_calls() {
+            return false;
+        }
+        self.admissions = self.admissions.saturating_add(1);
+        self.push_back(principal, SlotKind::Admit { action, ticket }, now);
+        true
+    }
+
     /// Put a gap slot in front of everything queued for `principal`.
     pub(super) fn push_gap_front(
         &mut self,
@@ -456,10 +577,10 @@ impl Lanes {
         self.pending_since
     }
 
-    /// Whether a chain registration is waiting, so the writer should not
-    /// wait for the window.
+    /// Whether a host call is waiting on this queue (an admission or a
+    /// chain registration), so the writer should not wait for the window.
     pub(super) fn urgent(&self) -> bool {
-        !self.unregistered.is_empty()
+        self.admissions > 0 || !self.unregistered.is_empty()
     }
 
     /// Chains to add to the lane marker before their first entry is written.
@@ -467,10 +588,31 @@ impl Lanes {
         std::mem::take(&mut self.unregistered)
     }
 
-    /// Remove up to `max` slots in global queue order. Slots only ever leave
-    /// from the front of their chain's FIFO, so each chain keeps its order.
+    /// Remove up to `max` slots. Slots only ever leave from the front of
+    /// their chain's FIFO, so each chain keeps its order. Chains with a
+    /// waiting admission go first, up to and including the admission, so a
+    /// fail-closed call waits for its own chain's backlog only; the rest
+    /// leave in global queue order. Abandoned admissions are dropped.
     pub(super) fn take(&mut self, max: usize, now: Instant) -> Vec<Slot> {
         let mut taken = Vec::new();
+        if self.admissions > 0 {
+            let waiting: Vec<PrincipalId> = self
+                .chains
+                .iter()
+                .filter(|(_, lane)| lane.fifo.iter().any(Slot::is_admission))
+                .map(|(principal, _)| principal.clone())
+                .collect();
+            for principal in waiting {
+                while taken.len() < max
+                    && self
+                        .chains
+                        .get(&principal)
+                        .is_some_and(|lane| lane.fifo.iter().any(Slot::is_admission))
+                {
+                    self.take_front(&principal, &mut taken);
+                }
+            }
+        }
         while taken.len() < max {
             let Some(principal) = self
                 .chains
@@ -498,7 +640,31 @@ impl Lanes {
             return;
         };
         self.queued_slots = self.queued_slots.saturating_sub(1);
+        if let SlotKind::Admit { ticket, .. } = &slot.kind {
+            self.admissions = self.admissions.saturating_sub(1);
+            if ticket.is_abandoned() {
+                return;
+            }
+        }
         taken.push(slot);
+    }
+
+    /// Remove every queued admission, for failing them while the log is
+    /// unavailable.
+    pub(super) fn take_admissions(&mut self) -> Vec<Arc<AdmitTicket>> {
+        let mut tickets = Vec::new();
+        for lane in self.chains.values_mut() {
+            lane.fifo.retain(|slot| match &slot.kind {
+                SlotKind::Admit { ticket, .. } => {
+                    tickets.push(Arc::clone(ticket));
+                    false
+                },
+                _ => true,
+            });
+        }
+        self.queued_slots = self.queued_slots.saturating_sub(tickets.len());
+        self.admissions = self.admissions.saturating_sub(tickets.len());
+        tickets
     }
 }
 

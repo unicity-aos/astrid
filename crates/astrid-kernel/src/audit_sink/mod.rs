@@ -17,6 +17,13 @@
 //! in a signed loss entry at its place in the chain, and a lane run that
 //! stops without draining leaves a signed gap entry at the next start (see
 //! [`marker`]). Producers never block on the queue.
+//!
+//! # Fail-closed classes
+//!
+//! For host-call classes in `audit.host_fail_closed`, [`HostAuditSink::admit`]
+//! queues a write-ahead entry and waits until it is durable before the effect
+//! runs; if it cannot be recorded, the call is refused and the refusal is
+//! recorded as a denial.
 
 mod lane;
 mod marker;
@@ -27,16 +34,16 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use astrid_audit::host_call::HostCallOutcome;
+use astrid_audit::host_call::{HOST_CALL_CLASSES, HostCallOutcome};
 use astrid_audit::{AuditAction, AuditLog};
-use astrid_capsule::{HostAuditEvent, HostAuditOutcome, HostAuditSink};
+use astrid_capsule::{HostAuditEvent, HostAuditOutcome, HostAuditRefusal, HostAuditSink};
 use astrid_config::types::AuditConfig;
 use astrid_core::{PrincipalId, SessionId, Timestamp};
 use astrid_crypto::ContentHash;
 use astrid_storage::ScopedKvStore;
 use tracing::warn;
 
-use lane::{Call, Lanes, Lifecycle, Pushed};
+use lane::{AdmitTicket, Call, Lanes, Lifecycle, Pushed};
 use writer::{HealthState, Shared, WriterConfig};
 
 /// Authorization reason stamped on an allowed or failed manifest-gated host
@@ -59,6 +66,9 @@ const MANIFEST_GATED_REASON: &str = "manifest-gated host call";
 /// useful.
 const MAX_AUDIT_STR_BYTES: usize = 1024;
 
+/// How long a fail-closed host call waits for its write-ahead entry.
+const FAIL_CLOSED_WAIT: Duration = Duration::from_secs(10);
+
 /// Operator policy for the host-audit writer. Built from [`AuditConfig`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostAuditPolicy {
@@ -66,6 +76,8 @@ pub struct HostAuditPolicy {
     max_batch: usize,
     queue_capacity: usize,
     persist_path_probes: bool,
+    /// Bit `i` set: class `HOST_CALL_CLASSES[i]` fails closed.
+    fail_closed: u8,
 }
 
 impl Default for HostAuditPolicy {
@@ -76,6 +88,11 @@ impl Default for HostAuditPolicy {
 
 impl From<&AuditConfig> for HostAuditPolicy {
     fn from(config: &AuditConfig) -> Self {
+        let fail_closed = HOST_CALL_CLASSES
+            .iter()
+            .enumerate()
+            .filter(|(_, class)| config.host_fail_closed.iter().any(|name| name == *class))
+            .fold(0_u8, |bits, (index, _)| bits | (1 << index));
         Self {
             coalesce: Duration::from_millis(config.host_coalesce_ms),
             max_batch: usize::try_from(config.host_batch_max)
@@ -85,7 +102,25 @@ impl From<&AuditConfig> for HostAuditPolicy {
                 .unwrap_or(4096)
                 .clamp(64, 65_536),
             persist_path_probes: config.host_path_probes,
+            fail_closed,
         }
+    }
+}
+
+impl HostAuditPolicy {
+    /// Whether `event` must be admitted through a durable write-ahead entry.
+    fn fails_closed(&self, event: &HostAuditEvent<'_>) -> bool {
+        let index = match event {
+            HostAuditEvent::FileRead { .. } => 0,
+            HostAuditEvent::FileWrite { .. } => 1,
+            HostAuditEvent::FileDelete { .. } => 2,
+            HostAuditEvent::NetConnect { .. } => 3,
+            HostAuditEvent::NetBind { .. } => 4,
+            HostAuditEvent::NetAccept { .. } => 5,
+            HostAuditEvent::ProcessSpawn { .. } => 6,
+            HostAuditEvent::FileProbe { .. } => return false,
+        };
+        self.fail_closed & (1 << index) != 0
     }
 }
 
@@ -110,6 +145,9 @@ pub struct AuditSinkHealth {
     pub omitted_path_probes: u64,
     /// Durable gap entries for lane runs that stopped without draining.
     pub gaps_recorded: u64,
+    /// Fail-closed calls refused because their write-ahead entry was not
+    /// durable.
+    pub fail_closed_refused: u64,
     /// Calls reported after the writer stopped; they reach no entry.
     pub dropped_after_shutdown: u64,
     /// Whether the dedicated writer thread is alive.
@@ -176,6 +214,7 @@ impl AuditQueue {
             collapsed_repeats: health.collapsed_repeats,
             omitted_path_probes: self.omitted_path_probes.load(Ordering::Relaxed),
             gaps_recorded: health.gaps_recorded,
+            fail_closed_refused: health.fail_closed_refused,
             dropped_after_shutdown: health.dropped_after_shutdown,
             worker_alive: health.worker_alive,
             degraded: health.failed > 0 || health.marker_errors > 0 || !health.worker_alive,
@@ -240,6 +279,21 @@ fn truncate_guest_str(s: &str) -> String {
         .find(|&i| s.is_char_boundary(i))
         .unwrap_or(0);
     s[..end].to_owned()
+}
+
+/// Run a blocking wait without stalling a tokio worker thread.
+fn wait_blocking<T>(wait: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle)
+            if matches!(
+                handle.runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::MultiThread
+            ) =>
+        {
+            tokio::task::block_in_place(wait)
+        },
+        _ => wait(),
+    }
 }
 
 /// Persists capsule per-action host calls onto the kernel's signed audit
@@ -420,6 +474,22 @@ impl KernelAuditSink {
         );
     }
 
+    /// Queue a write-ahead entry and wait until it is durable.
+    fn admit_durably(&self, principal: &PrincipalId, action: AuditAction) -> Result<(), String> {
+        let ticket = Arc::new(AdmitTicket::new());
+        let queued = self.queue.shared.lanes().push_admit(
+            principal,
+            action,
+            Arc::clone(&ticket),
+            Instant::now(),
+        );
+        if !queued {
+            return Err("audit writer stopped".to_owned());
+        }
+        self.queue.shared.wake.notify_one();
+        wait_blocking(|| ticket.wait(FAIL_CLOSED_WAIT))
+    }
+
     /// Stop the writer as a crash would: nothing more is drained and the lane
     /// marker stays open.
     #[cfg(test)]
@@ -436,6 +506,40 @@ impl HostAuditSink for KernelAuditSink {
         outcome: HostAuditOutcome<'_>,
     ) {
         self.record_at(principal, event, outcome, Timestamp::now());
+    }
+
+    fn admit(
+        &self,
+        principal: &PrincipalId,
+        event: HostAuditEvent<'_>,
+    ) -> Result<(), HostAuditRefusal> {
+        if !self.policy.fails_closed(&event) {
+            return Ok(());
+        }
+        let action = Self::to_action(event);
+        let Err(reason) = self.admit_durably(principal, action.clone()) else {
+            return Ok(());
+        };
+        {
+            let mut health = self.queue.shared.health();
+            health.fail_closed_refused = health.fail_closed_refused.saturating_add(1);
+        }
+        warn!(
+            security_event = true,
+            %principal,
+            %reason,
+            "fail-closed host call refused: write-ahead audit entry not durable"
+        );
+        self.enqueue(
+            principal,
+            Call {
+                action,
+                outcome: HostCallOutcome::Denied,
+                detail: truncate_guest_str(&format!("fail-closed audit unavailable: {reason}")),
+                at: Timestamp::now(),
+            },
+        );
+        Err(HostAuditRefusal::new(reason))
     }
 }
 

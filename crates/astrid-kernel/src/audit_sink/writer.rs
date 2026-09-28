@@ -18,7 +18,7 @@ use astrid_storage::ScopedKvStore;
 use tracing::warn;
 
 use super::HostAuditPolicy;
-use super::lane::{Lanes, Lifecycle, Slot, SlotKind, gap_entry};
+use super::lane::{AdmitTicket, Lanes, Lifecycle, Slot, SlotKind, gap_entry};
 use super::marker::{GapDuty, LaneMarker};
 
 /// Attempts at a failing batch once shutdown has been requested.
@@ -29,7 +29,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(5);
 /// State shared by host-call producers and the writer.
 pub(super) struct Shared {
     pub(super) lanes: Mutex<Lanes>,
-    /// Wakes the writer: new slot or shutdown.
+    /// Wakes the writer: new slot, admission, or shutdown.
     pub(super) wake: Condvar,
     pub(super) health: Mutex<HealthState>,
 }
@@ -62,6 +62,7 @@ pub(super) struct HealthState {
     pub(super) failed: u64,
     pub(super) collapsed_repeats: u64,
     pub(super) gaps_recorded: u64,
+    pub(super) fail_closed_refused: u64,
     pub(super) dropped_after_shutdown: u64,
     pub(super) marker_errors: u64,
     pub(super) worker_alive: bool,
@@ -111,7 +112,7 @@ pub(super) fn run(shared: &Shared, config: &WriterConfig) {
         Ok(runtime) => runtime,
         Err(error) => {
             shared.note_error(format!("failed to create audit writer runtime: {error}"));
-            stop(shared);
+            stop(shared, "audit writer runtime unavailable");
             return;
         },
     };
@@ -131,7 +132,7 @@ pub(super) fn run(shared: &Shared, config: &WriterConfig) {
     while let Some(work) = writer.next_work() {
         writer.register(work.register);
         writer.record_system_gaps();
-        if !writer.persist(&work.slots) {
+        if !writer.persist(work.slots) {
             drained = false;
             break;
         }
@@ -141,16 +142,20 @@ pub(super) fn run(shared: &Shared, config: &WriterConfig) {
     if drained && !abandoned {
         writer.close_marker();
     }
-    stop(shared);
+    stop(shared, "audit writer stopped");
 }
 
-/// Refuse further calls.
-fn stop(shared: &Shared) {
-    {
+/// Refuse further calls and fail every waiting admission.
+fn stop(shared: &Shared, reason: &str) {
+    let tickets = {
         let mut lanes = shared.lanes();
         if lanes.lifecycle != Lifecycle::Abandoned {
             lanes.lifecycle = Lifecycle::Closed;
         }
+        lanes.take_admissions()
+    };
+    for ticket in tickets {
+        ticket.resolve(Err(reason.to_owned()));
     }
     shared.health().worker_alive = false;
 }
@@ -313,7 +318,7 @@ impl Writer<'_> {
 
     /// Append `slots` in order, retrying until durable. Returns `false` when
     /// shutdown gave up on a failing batch.
-    fn persist(&mut self, slots: &[Slot]) -> bool {
+    fn persist(&mut self, mut slots: Vec<Slot>) -> bool {
         let mut attempt = 0_u32;
         loop {
             if slots.is_empty() {
@@ -335,7 +340,7 @@ impl Writer<'_> {
                 Some("audit batch returned a partial result".to_owned())
             };
             let Some(error) = error else {
-                self.settle(slots);
+                self.settle(&slots);
                 return true;
             };
             attempt = attempt.saturating_add(1);
@@ -345,9 +350,28 @@ impl Writer<'_> {
             }
             self.shared
                 .note_error(format!("host-audit batch append failed: {error}"));
+            self.refuse_admissions(&mut slots, &error);
             if !self.backoff(attempt) {
                 return false;
             }
+        }
+    }
+
+    /// A fail-closed call must not wait out a failing log: refuse every
+    /// admission in the failed batch and in the queue. Refused calls do not
+    /// run their effect, so their write-ahead entries are dropped.
+    fn refuse_admissions(&self, slots: &mut Vec<Slot>, error: &str) {
+        let mut tickets: Vec<Arc<AdmitTicket>> = Vec::new();
+        slots.retain(|slot| match &slot.kind {
+            SlotKind::Admit { ticket, .. } => {
+                tickets.push(Arc::clone(ticket));
+                false
+            },
+            _ => true,
+        });
+        tickets.extend(self.shared.lanes().take_admissions());
+        for ticket in tickets {
+            ticket.resolve(Err(error.to_owned()));
         }
     }
 
@@ -385,7 +409,7 @@ impl Writer<'_> {
         lanes.lifecycle != Lifecycle::Abandoned
     }
 
-    /// Account a durable batch.
+    /// Account a durable batch and release its admissions.
     fn settle(&mut self, slots: &[Slot]) {
         let settled: u64 = slots.iter().map(Slot::calls).sum();
         {
@@ -407,6 +431,7 @@ impl Writer<'_> {
                     health.gaps_recorded = health.gaps_recorded.saturating_add(1);
                     self.gaps.chain_entries = self.gaps.chain_entries.saturating_sub(1);
                 },
+                SlotKind::Admit { ticket, .. } => ticket.resolve(Ok(())),
             }
         }
     }
