@@ -615,3 +615,51 @@ async fn http_run_id_is_the_lane_epoch_a_gap_names() {
     assert_ne!(second_run, first_run);
     assert!(log.verify_chain(&session).await.expect("verify").valid);
 }
+
+/// A record committed after the writer stopped is still durable before the
+/// caller continues: it is appended directly, after everything the drained
+/// lane wrote.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn commit_after_shutdown_is_appended_directly() {
+    let log = Arc::new(AuditLog::in_memory(KeyPair::generate()));
+    let session = SessionId::from_uuid(uuid::Uuid::from_u128(0x0d07));
+    let sink = KernelAuditSink::with_policy(
+        Arc::clone(&log),
+        session.clone(),
+        policy(LONG_WINDOW_MS, 4096, &[]),
+    );
+    let files = sink.attributed(host_actor("fs-tool")).expect("attributed");
+    let llm = sink.attributed(host_actor("llm")).expect("attributed");
+    let p = alice();
+    for path in ["/w/a", "/w/b"] {
+        files.record(
+            &p,
+            HostAuditEvent::FileRead { path },
+            HostAuditOutcome::Allowed,
+        );
+    }
+    sink.shutdown();
+
+    let receipt = llm
+        .commit(
+            &p,
+            HostAuditEvent::HttpRequest(request("api.example.com")),
+            HostAuditOutcome::Allowed,
+        )
+        .await;
+    assert_eq!(receipt.sequence, Some(1));
+    let entries = log.get_principal_entries(&session, Some(&p)).await.unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(receipt.entry_id, Some(entries[1].id.clone()));
+    assert!(matches!(
+        &entries[0].action,
+        AuditAction::HostCallRun { calls, .. } if calls.count == 2
+    ));
+    assert!(matches!(
+        &entries[1].action,
+        AuditAction::HttpRequest { sequence: 1, .. }
+    ));
+    assert_eq!(capsule_of(&entries[1]), "llm");
+    assert_eq!(sink.health().dropped_after_shutdown, 0);
+    assert!(log.verify_chain(&session).await.expect("verify").valid);
+}

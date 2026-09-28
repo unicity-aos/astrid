@@ -25,7 +25,9 @@
 //! [`HostAuditSink::commit`] (HTTP pre-commits and completions, answered
 //! approval prompts) queues its record at the tail of the same FIFO and waits
 //! until the entry is durable, so a committed record keeps its place in call
-//! order. HTTP requests are numbered per principal and lane run: the `run_id`
+//! order. Only a failed append lets the caller continue first (and the record
+//! stays queued); after the writer has stopped, the record is appended
+//! directly. HTTP requests are numbered per principal and lane run: the `run_id`
 //! of an HTTP entry is the lane run's epoch, which a gap entry names when that
 //! run stopped without draining.
 //!
@@ -84,11 +86,6 @@ const MAX_AUDIT_STR_BYTES: usize = 1024;
 
 /// How long a fail-closed host call waits for its write-ahead entry.
 const FAIL_CLOSED_WAIT: Duration = Duration::from_secs(10);
-
-/// How long [`HostAuditSink::commit`] waits for its entry before the caller
-/// continues without an entry id. The record stays queued and is written in
-/// its place once the log accepts it.
-const COMMIT_WAIT: Duration = Duration::from_secs(10);
 
 /// Operator policy for the host-audit writer. Built from [`AuditConfig`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -336,6 +333,11 @@ fn wait_blocking<T>(wait: impl FnOnce() -> T) -> T {
 pub struct KernelAuditSink {
     /// Ordered lane and its writer. Producers never block on a full queue.
     queue: Arc<AuditQueue>,
+    /// The audit log and session, for a committed record that arrives after
+    /// the writer stopped: it is appended directly so it is still durable
+    /// before the host call proceeds.
+    audit_log: Arc<AuditLog>,
+    session_id: SessionId,
     policy: HostAuditPolicy,
     /// Capsule code identity stamped on every entry this handle writes.
     /// `None` on the kernel's own handle; set on the per-capsule handles the
@@ -395,7 +397,15 @@ impl KernelAuditSink {
         let epoch = uuid::Uuid::new_v4().to_string();
         Self {
             run_id: Arc::from(epoch.as_str()),
-            queue: AuditQueue::new(audit_log, session_id, policy, marker, epoch),
+            queue: AuditQueue::new(
+                Arc::clone(&audit_log),
+                session_id.clone(),
+                policy,
+                marker,
+                epoch,
+            ),
+            audit_log,
+            session_id,
             policy,
             actor: None,
             http_sequences: Arc::default(),
@@ -505,24 +515,13 @@ impl KernelAuditSink {
     ///
     /// An HTTP request takes the next number of its principal's sequence in
     /// the same critical section that queues it, so the numbers increase
-    /// along the chain. With `commit`, the record is its own entry and the
-    /// sender learns when it is durable. Returns how the record was queued
-    /// and the HTTP sequence number it took, if any.
-    fn enqueue(
-        &self,
-        principal: &PrincipalId,
-        mut call: Call,
-        commit: Option<CommitSender>,
-    ) -> (Pushed, Option<u64>) {
+    /// along the chain. Returns how the record was queued and the HTTP
+    /// sequence number it took, if any.
+    fn enqueue(&self, principal: &PrincipalId, mut call: Call) -> (Pushed, Option<u64>) {
         let (pushed, sequence) = {
             let mut lanes = self.queue.shared.lanes();
             let sequence = self.stamp_http_sequence(principal, &mut call.action);
-            let now = Instant::now();
-            let pushed = match commit {
-                Some(sender) => lanes.push_commit(principal, call, sender, now),
-                None => lanes.push_call(principal, call, now),
-            };
-            (pushed, sequence)
+            (lanes.push_call(principal, call, Instant::now()), sequence)
         };
         match pushed {
             Pushed::Folded => {},
@@ -540,6 +539,30 @@ impl KernelAuditSink {
             },
         }
         (pushed, sequence)
+    }
+
+    /// Queue a record the caller waits for, as its own entry behind
+    /// everything already queued for its chain; `commit` learns when it is
+    /// durable. Numbers an HTTP request like [`enqueue`](Self::enqueue).
+    /// Returns the record when the writer has stopped.
+    fn enqueue_commit(
+        &self,
+        principal: &PrincipalId,
+        mut call: Call,
+        commit: CommitSender,
+    ) -> (Result<(), Box<Call>>, Option<u64>) {
+        let (queued, sequence) = {
+            let mut lanes = self.queue.shared.lanes();
+            let sequence = self.stamp_http_sequence(principal, &mut call.action);
+            (
+                lanes.push_commit(principal, call, commit, Instant::now()),
+                sequence,
+            )
+        };
+        if queued.is_ok() {
+            self.queue.shared.wake.notify_one();
+        }
+        (queued, sequence)
     }
 
     fn record_at(
@@ -567,7 +590,6 @@ impl KernelAuditSink {
                 detail,
                 at,
             },
-            None,
         );
     }
 
@@ -635,7 +657,6 @@ impl HostAuditSink for KernelAuditSink {
                 detail: truncate_guest_str(&format!("fail-closed audit unavailable: {reason}")),
                 at: Timestamp::now(),
             },
-            None,
         );
         Err(HostAuditRefusal::new(reason))
     }

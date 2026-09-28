@@ -6,7 +6,7 @@
 use std::sync::PoisonError;
 
 use astrid_audit::{
-    ApprovalScope, AuditAction, AuthorizationProof, CapsuleActor, ProviderRequestId,
+    ApprovalScope, AuditAction, AuditEntryId, AuthorizationProof, CapsuleActor, ProviderRequestId,
 };
 use astrid_capsule::{
     HostApprovalDecision, HostApprovalScope, HostAuditActor, HostAuditEvent, HostAuditOutcome,
@@ -16,7 +16,7 @@ use astrid_core::{PrincipalId, Timestamp};
 use astrid_crypto::ContentHash;
 use tracing::warn;
 
-use super::lane::{Call, Pushed};
+use super::lane::{Call, call_entry};
 use super::{KernelAuditSink, truncate_guest_str};
 
 /// Most provider request ids kept on one HTTP completion.
@@ -238,13 +238,13 @@ impl KernelAuditSink {
     /// durable.
     ///
     /// The record keeps its place in call order: it is written after every
-    /// record queued before it for the same chain. A record that is not
-    /// durable within [`COMMIT_WAIT`](super::COMMIT_WAIT), or whose batch
-    /// append failed, does not fail the host call: it is logged and reported
-    /// as a receipt without an entry id, and it stays queued, so it is still
-    /// written in its place once the log accepts it. Only a record reported
-    /// after the writer stopped is not written; its sequence number stays
-    /// consumed, so it shows as a gap.
+    /// record queued before it for the same chain. The wait ends when the
+    /// entry is durable or when an append attempt of its batch fails. A
+    /// failed attempt does not fail the host call: it is logged and reported
+    /// as a receipt without an entry id, and the record stays queued, so it
+    /// is still written in its place once the log accepts it. A record that
+    /// arrives after the writer stopped (the queue is drained by then) is
+    /// appended directly, so it is durable before the host call proceeds.
     pub(super) async fn commit_in_order(
         &self,
         principal: &PrincipalId,
@@ -253,50 +253,64 @@ impl KernelAuditSink {
     ) -> HostAuditReceipt {
         let (outcome, detail) = Self::classify(outcome);
         let (sender, receiver) = tokio::sync::oneshot::channel();
-        let (pushed, sequence) = self.enqueue(
-            principal,
-            Call {
-                action: Self::to_action(event, self.actor()),
-                outcome,
-                detail,
-                at: Timestamp::now(),
+        let call = Call {
+            action: Self::to_action(event, self.actor()),
+            outcome,
+            detail,
+            at: Timestamp::now(),
+        };
+        let (queued, sequence) = self.enqueue_commit(principal, call, sender);
+        let entry_id = match queued {
+            Err(call) => self.append_directly(principal, *call).await,
+            Ok(()) => match receiver.await {
+                Ok(Ok(entry_id)) => Some(entry_id),
+                Ok(Err(error)) => {
+                    warn!(
+                        security_event = true,
+                        %principal,
+                        %error,
+                        "Durable audit append failed; continuing, the record stays queued"
+                    );
+                    None
+                },
+                Err(_) => {
+                    warn!(
+                        security_event = true,
+                        %principal,
+                        "Audit writer stopped before the record was durable; continuing"
+                    );
+                    None
+                },
             },
-            Some(sender),
-        );
-        if pushed == Pushed::Closed {
-            return HostAuditReceipt {
-                sequence,
-                entry_id: None,
-            };
-        }
-        let entry_id = match tokio::time::timeout(super::COMMIT_WAIT, receiver).await {
-            Ok(Ok(Ok(entry_id))) => Some(entry_id),
-            Ok(Ok(Err(error))) => {
+        };
+        HostAuditReceipt { sequence, entry_id }
+    }
+
+    /// Append a committed record straight to the log, for a record that
+    /// arrives after the lane's writer stopped.
+    async fn append_directly(&self, principal: &PrincipalId, call: Call) -> Option<AuditEntryId> {
+        let (action, authorization, outcome) = call_entry(call.action, call.outcome, call.detail);
+        let appended = self
+            .audit_log
+            .append_with_principal(
+                self.session_id.clone(),
+                principal.clone(),
+                action,
+                authorization,
+                outcome,
+            )
+            .await;
+        match appended {
+            Ok(entry_id) => Some(entry_id),
+            Err(error) => {
                 warn!(
                     security_event = true,
                     %principal,
                     %error,
-                    "Durable audit append failed; continuing, the record stays queued"
+                    "Failed to append durable audit entry; continuing"
                 );
                 None
             },
-            Ok(Err(_)) => {
-                warn!(
-                    security_event = true,
-                    %principal,
-                    "Audit writer stopped before the record was durable; continuing"
-                );
-                None
-            },
-            Err(_) => {
-                warn!(
-                    security_event = true,
-                    %principal,
-                    "Audit record not durable in time; continuing, the record stays queued"
-                );
-                None
-            },
-        };
-        HostAuditReceipt { sequence, entry_id }
+        }
     }
 }

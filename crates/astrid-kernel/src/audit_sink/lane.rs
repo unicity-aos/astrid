@@ -178,7 +178,7 @@ impl Summary {
 /// The entry of one record: a manifest-gated (or, for tool calls and
 /// approvals, the matching system reason) authorization for an allowed or
 /// failed record, a denial otherwise.
-fn call_entry(
+pub(super) fn call_entry(
     action: AuditAction,
     outcome: HostCallOutcome,
     detail: String,
@@ -637,16 +637,18 @@ impl Lanes {
 
     /// Queue a record the caller waits for as its own slot behind everything
     /// already queued for its chain. Committed records are bounded by their
-    /// waiting callers, so they may exceed the queue capacity.
+    /// waiting callers, so they may exceed the queue capacity. Returns the
+    /// record when the writer has stopped, so the caller can append it
+    /// another way.
     pub(super) fn push_commit(
         &mut self,
         principal: &PrincipalId,
         call: Call,
         commit: CommitSender,
         now: Instant,
-    ) -> Pushed {
+    ) -> Result<(), Box<Call>> {
         if self.lifecycle.refuses_calls() {
-            return Pushed::Closed;
+            return Err(Box::new(call));
         }
         self.accepted = self.accepted.saturating_add(1);
         self.queued_calls = self.queued_calls.saturating_add(1);
@@ -659,7 +661,7 @@ impl Lanes {
             },
             now,
         );
-        Pushed::Queued
+        Ok(())
     }
 
     /// Queue a write-ahead admission. Admissions are bounded by concurrent
