@@ -133,12 +133,16 @@ impl LaneMarker {
         };
         if let Err(error) = marker.sync(runtime) {
             errors.push(error);
-            duties.push(GapDuty {
+            let unavailable = GapDuty {
                 epoch: marker.state.epoch.clone(),
                 opened_at,
                 chains: Vec::new(),
                 reason: MARKER_UNAVAILABLE.to_owned(),
-            });
+            };
+            // Kept in the marker too: once a later sync writes it, a crash
+            // before this gap is recorded must still leave the duty behind.
+            marker.state.pending_gaps.push(unavailable.clone());
+            duties.push(unavailable);
         }
         Opened {
             marker,

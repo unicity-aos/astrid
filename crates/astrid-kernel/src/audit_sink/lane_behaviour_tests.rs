@@ -469,6 +469,48 @@ async fn unavailable_marker_store_is_recorded_as_gaps() {
     assert_eq!(second.health().gaps_recorded, 0);
 }
 
+/// The gap a run owes for its own unwritable marker stays owed after the
+/// store recovers: a crash before the gap entry is durable leaves it to the
+/// next run.
+#[test]
+fn unavailable_marker_duty_survives_a_later_marker_write() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let kv = Arc::new(FlakyKv {
+        inner: astrid_storage::MemoryKvStore::new(),
+        failing: std::sync::atomic::AtomicBool::new(true),
+    });
+    let store = ScopedKvStore::new(
+        Arc::clone(&kv) as Arc<dyn astrid_storage::KvStore>,
+        "system:control:audit-lane",
+    )
+    .expect("marker scope");
+    let mut first =
+        marker::LaneMarker::open(&runtime, store.clone(), "run-1".into(), Timestamp::now());
+    assert_eq!(first.errors.len(), 2);
+    kv.failing.store(false, Ordering::SeqCst);
+    first
+        .marker
+        .register(&runtime, &[PrincipalId::new("alice").expect("alice")])
+        .expect("register");
+    // Run 1 dies before recording its gaps.
+    let second = marker::LaneMarker::open(&runtime, store, "run-2".into(), Timestamp::now());
+    let owed: Vec<_> = second
+        .duties
+        .iter()
+        .map(|duty| (duty.epoch.as_str(), duty.reason.as_str()))
+        .collect();
+    assert_eq!(
+        owed,
+        [
+            ("unknown", "lane_marker_unreadable"),
+            ("run-1", "lane_marker_unavailable"),
+            ("run-1", "unclean_shutdown"),
+        ]
+    );
+}
+
 fn fail_closed_policy(classes: &[&str]) -> HostAuditPolicy {
     HostAuditPolicy::from(&AuditConfig {
         host_coalesce_ms: 60_000,
