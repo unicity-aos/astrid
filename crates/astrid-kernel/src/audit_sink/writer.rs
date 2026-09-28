@@ -124,6 +124,11 @@ pub(super) fn run(shared: &Shared, config: &WriterConfig) {
         },
     };
     writer.open_marker();
+    // A stopped run that registered no chains owes only system-chain gaps,
+    // which queue no lane work: record them now rather than with the next
+    // host call.
+    writer.record_system_gaps();
+    writer.settle_gaps();
     let mut drained = true;
     while let Some(work) = writer.next_work() {
         writer.register(&work.register);

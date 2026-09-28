@@ -234,6 +234,44 @@ async fn unreadable_marker_is_recorded_as_a_gap_and_replaced() {
     assert_eq!(second.health().gaps_recorded, 0, "the marker was replaced");
 }
 
+/// A gap owed only to the system chain is written when the lane starts, not
+/// held until the next host call or shutdown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn system_only_gap_is_recorded_without_a_host_call() {
+    let log = Arc::new(AuditLog::in_memory(KeyPair::generate()));
+    let session = SessionId::from_uuid(uuid::Uuid::from_u128(0x09b9));
+    let marker = marker_store();
+    marker
+        .set("lane", b"not a marker".to_vec())
+        .await
+        .expect("corrupt marker");
+
+    let sink = KernelAuditSink::with_lane_marker(
+        Arc::clone(&log),
+        session.clone(),
+        policy(10, 128, 4096),
+        marker,
+    );
+    let deadline = std::time::Instant::now()
+        .checked_add(std::time::Duration::from_secs(10))
+        .expect("deadline");
+    while sink.health().gaps_recorded < 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "gap not recorded while idle"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        log.get_principal_entries(&session, None)
+            .await
+            .expect("system entries")
+            .len(),
+        1
+    );
+    sink.shutdown();
+}
+
 /// A batch the log refuses is kept and retried, in order and without loss,
 /// until the log accepts it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
