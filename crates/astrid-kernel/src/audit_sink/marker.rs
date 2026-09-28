@@ -10,9 +10,10 @@
 //! gap entry in every chain the run registered, and one in the session's
 //! system chain, which covers chains that were touched but not yet
 //! registered. Duties stay in the marker until their entries are durable, so
-//! a second crash does not lose them. A marker that cannot be parsed says
-//! nothing about the previous run, so it is treated as an unclean stop of an
-//! unknown run and replaced.
+//! a second crash does not lose them. A marker that cannot be read or parsed
+//! says nothing about the previous run, so it is treated as an unclean stop
+//! of an unknown run and replaced. A run whose marker cannot be written
+//! records that about itself, because a crash would then go unnoticed.
 
 use astrid_core::{PrincipalId, Timestamp};
 use astrid_storage::ScopedKvStore;
@@ -22,8 +23,10 @@ const MARKER_KEY: &str = "lane";
 const MARKER_VERSION: u32 = 1;
 /// Gap reason for a lane run that stopped without draining.
 pub(super) const UNCLEAN_SHUTDOWN: &str = "unclean_shutdown";
-/// Gap reason when the previous run's marker could not be parsed.
+/// Gap reason when the previous run's marker could not be read or parsed.
 pub(super) const MARKER_UNREADABLE: &str = "lane_marker_unreadable";
+/// Gap reason, recorded by a run itself, when its marker cannot be written.
+pub(super) const MARKER_UNAVAILABLE: &str = "lane_marker_unavailable";
 
 fn unclean_shutdown() -> String {
     UNCLEAN_SHUTDOWN.to_owned()
@@ -53,53 +56,70 @@ struct MarkerState {
 pub(super) struct LaneMarker {
     store: ScopedKvStore,
     state: MarkerState,
+    /// Whether `state` is what the store holds.
+    saved: bool,
+}
+
+/// What opening the lane marker found.
+pub(super) struct Opened {
+    pub(super) marker: LaneMarker,
+    /// Gap entries the new run must record.
+    pub(super) duties: Vec<GapDuty>,
+    /// Marker errors met on the way; each is reported, none stops the lane.
+    pub(super) errors: Vec<String>,
+}
+
+fn unknown_run(opened_at: Timestamp) -> GapDuty {
+    GapDuty {
+        epoch: "unknown".to_owned(),
+        opened_at,
+        chains: Vec::new(),
+        reason: MARKER_UNREADABLE.to_owned(),
+    }
 }
 
 impl LaneMarker {
     /// Load the previous marker, start a new lane run, and return the gap
     /// duties the new run must record.
     ///
-    /// # Errors
-    ///
-    /// Returns an error when the marker cannot be read, parsed or written.
+    /// A previous marker that cannot be read or parsed says nothing about
+    /// the previous run, which becomes a gap of an unknown run. When the new
+    /// marker cannot be written, a crash of this run would go unnoticed, so
+    /// this run gets a gap duty of its own (`lane_marker_unavailable`); the
+    /// write is retried by [`sync`](Self::sync).
     pub(super) fn open(
         runtime: &tokio::runtime::Runtime,
         store: ScopedKvStore,
         epoch: String,
         opened_at: Timestamp,
-    ) -> Result<(Self, Vec<GapDuty>), String> {
-        let stored = runtime
-            .block_on(store.get(MARKER_KEY))
-            .map_err(|error| format!("read host-audit lane marker: {error}"))?;
+    ) -> Opened {
         let mut duties = Vec::new();
-        match stored.map(|bytes| serde_json::from_slice::<MarkerState>(&bytes)) {
-            None => {},
-            Some(Ok(previous)) => {
-                duties.extend(previous.pending_gaps);
-                if !previous.closed {
-                    duties.push(GapDuty {
-                        epoch: previous.epoch,
-                        opened_at: previous.opened_at,
-                        chains: previous.chains,
-                        reason: unclean_shutdown(),
-                    });
-                }
+        let mut errors = Vec::new();
+        match runtime.block_on(store.get(MARKER_KEY)) {
+            Ok(None) => {},
+            Ok(Some(bytes)) => match serde_json::from_slice::<MarkerState>(&bytes) {
+                Ok(previous) => {
+                    duties.extend(previous.pending_gaps);
+                    if !previous.closed {
+                        duties.push(GapDuty {
+                            epoch: previous.epoch,
+                            opened_at: previous.opened_at,
+                            chains: previous.chains,
+                            reason: unclean_shutdown(),
+                        });
+                    }
+                },
+                Err(error) => {
+                    errors.push(format!("parse host-audit lane marker: {error}"));
+                    duties.push(unknown_run(opened_at));
+                },
             },
-            Some(Err(error)) => {
-                tracing::warn!(
-                    security_event = true,
-                    %error,
-                    "host-audit lane marker unreadable; recording a gap for the unknown previous run"
-                );
-                duties.push(GapDuty {
-                    epoch: "unknown".to_owned(),
-                    opened_at,
-                    chains: Vec::new(),
-                    reason: MARKER_UNREADABLE.to_owned(),
-                });
+            Err(error) => {
+                errors.push(format!("read host-audit lane marker: {error}"));
+                duties.push(unknown_run(opened_at));
             },
         }
-        let marker = Self {
+        let mut marker = Self {
             store,
             state: MarkerState {
                 version: MARKER_VERSION,
@@ -109,31 +129,54 @@ impl LaneMarker {
                 chains: Vec::new(),
                 pending_gaps: duties.clone(),
             },
+            saved: false,
         };
-        marker.save(runtime)?;
-        Ok((marker, duties))
+        if let Err(error) = marker.sync(runtime) {
+            errors.push(error);
+            duties.push(GapDuty {
+                epoch: marker.state.epoch.clone(),
+                opened_at,
+                chains: Vec::new(),
+                reason: MARKER_UNAVAILABLE.to_owned(),
+            });
+        }
+        Opened {
+            marker,
+            duties,
+            errors,
+        }
     }
 
-    fn save(&self, runtime: &tokio::runtime::Runtime) -> Result<(), String> {
+    /// Write the marker if the store does not hold its current state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the marker cannot be written; it stays unsaved
+    /// and the next call tries again.
+    pub(super) fn sync(&mut self, runtime: &tokio::runtime::Runtime) -> Result<(), String> {
+        if self.saved {
+            return Ok(());
+        }
         let bytes = serde_json::to_vec(&self.state)
             .map_err(|error| format!("encode host-audit lane marker: {error}"))?;
         runtime
             .block_on(self.store.set(MARKER_KEY, bytes))
-            .map_err(|error| format!("write host-audit lane marker: {error}"))
+            .map_err(|error| format!("write host-audit lane marker: {error}"))?;
+        self.saved = true;
+        Ok(())
     }
 
     /// Add chains before the lane writes to them in this run.
     ///
     /// # Errors
     ///
-    /// Returns an error when the marker cannot be written; the chains are
-    /// then not registered.
+    /// Returns an error when the marker cannot be written; the chains stay
+    /// in the unsaved state and the next [`sync`](Self::sync) writes them.
     pub(super) fn register(
         &mut self,
         runtime: &tokio::runtime::Runtime,
         principals: &[PrincipalId],
     ) -> Result<(), String> {
-        let before = self.state.chains.len();
         for principal in principals {
             if !self
                 .state
@@ -142,14 +185,10 @@ impl LaneMarker {
                 .any(|chain| chain == principal.as_str())
             {
                 self.state.chains.push(principal.as_str().to_owned());
+                self.saved = false;
             }
         }
-        if self.state.chains.len() == before {
-            return Ok(());
-        }
-        self.save(runtime).inspect_err(|_| {
-            self.state.chains.truncate(before);
-        })
+        self.sync(runtime)
     }
 
     /// Drop the gap duties once all their entries are durable.
@@ -161,13 +200,11 @@ impl LaneMarker {
         &mut self,
         runtime: &tokio::runtime::Runtime,
     ) -> Result<(), String> {
-        if self.state.pending_gaps.is_empty() {
-            return Ok(());
+        if !self.state.pending_gaps.is_empty() {
+            self.state.pending_gaps.clear();
+            self.saved = false;
         }
-        let pending = std::mem::take(&mut self.state.pending_gaps);
-        self.save(runtime).inspect_err(|_| {
-            self.state.pending_gaps = pending;
-        })
+        self.sync(runtime)
     }
 
     /// Mark the lane run closed after a complete drain.
@@ -177,6 +214,7 @@ impl LaneMarker {
     /// Returns an error when the marker cannot be written.
     pub(super) fn close(&mut self, runtime: &tokio::runtime::Runtime) -> Result<(), String> {
         self.state.closed = true;
-        self.save(runtime)
+        self.saved = false;
+        self.sync(runtime)
     }
 }

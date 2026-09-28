@@ -307,25 +307,166 @@ fn unrecorded_gap_duties_carry_over_to_the_next_run() {
         .build()
         .expect("runtime");
     let store = marker_store();
-    let (_first, duties) =
-        marker::LaneMarker::open(&runtime, store.clone(), "run-1".into(), Timestamp::now())
-            .expect("open run 1");
-    assert!(duties.is_empty());
-    let (mut second, duties) =
-        marker::LaneMarker::open(&runtime, store.clone(), "run-2".into(), Timestamp::now())
-            .expect("open run 2");
-    assert_eq!(duties.len(), 1);
-    assert_eq!(duties[0].epoch, "run-1");
+    let first = marker::LaneMarker::open(&runtime, store.clone(), "run-1".into(), Timestamp::now());
+    assert!(first.duties.is_empty() && first.errors.is_empty());
+    let mut second =
+        marker::LaneMarker::open(&runtime, store.clone(), "run-2".into(), Timestamp::now());
+    assert_eq!(second.duties.len(), 1);
+    assert_eq!(second.duties[0].epoch, "run-1");
     second
+        .marker
         .register(&runtime, &[PrincipalId::new("alice").expect("alice")])
         .expect("register");
     // Run 2 dies before recording run 1's gap.
-    let (_third, duties) =
-        marker::LaneMarker::open(&runtime, store, "run-3".into(), Timestamp::now())
-            .expect("open run 3");
-    let epochs: Vec<_> = duties.iter().map(|duty| duty.epoch.as_str()).collect();
+    let third = marker::LaneMarker::open(&runtime, store, "run-3".into(), Timestamp::now());
+    let epochs: Vec<_> = third
+        .duties
+        .iter()
+        .map(|duty| duty.epoch.as_str())
+        .collect();
     assert_eq!(epochs, ["run-1", "run-2"]);
-    assert_eq!(duties[1].chains, ["alice"]);
+    assert_eq!(third.duties[1].chains, ["alice"]);
+}
+
+/// Memory store whose every operation fails while `failing` is set.
+struct FlakyKv {
+    inner: astrid_storage::MemoryKvStore,
+    failing: std::sync::atomic::AtomicBool,
+}
+
+impl FlakyKv {
+    fn check(&self) -> astrid_storage::StorageResult<()> {
+        if self.failing.load(Ordering::SeqCst) {
+            return Err(astrid_storage::StorageError::Connection(
+                "marker store offline".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl astrid_storage::KvStore for FlakyKv {
+    async fn get(
+        &self,
+        namespace: &str,
+        key: &str,
+    ) -> astrid_storage::StorageResult<Option<Vec<u8>>> {
+        self.check()?;
+        self.inner.get(namespace, key).await
+    }
+    async fn set(
+        &self,
+        namespace: &str,
+        key: &str,
+        value: Vec<u8>,
+    ) -> astrid_storage::StorageResult<()> {
+        self.check()?;
+        self.inner.set(namespace, key, value).await
+    }
+    async fn delete(&self, namespace: &str, key: &str) -> astrid_storage::StorageResult<bool> {
+        self.check()?;
+        self.inner.delete(namespace, key).await
+    }
+    async fn exists(&self, namespace: &str, key: &str) -> astrid_storage::StorageResult<bool> {
+        self.check()?;
+        self.inner.exists(namespace, key).await
+    }
+    async fn list_keys(&self, namespace: &str) -> astrid_storage::StorageResult<Vec<String>> {
+        self.check()?;
+        self.inner.list_keys(namespace).await
+    }
+    async fn list_keys_with_prefix(
+        &self,
+        namespace: &str,
+        prefix: &str,
+    ) -> astrid_storage::StorageResult<Vec<String>> {
+        self.check()?;
+        self.inner.list_keys_with_prefix(namespace, prefix).await
+    }
+    async fn compare_and_swap(
+        &self,
+        namespace: &str,
+        key: &str,
+        expected: Option<&[u8]>,
+        new: Vec<u8>,
+    ) -> astrid_storage::StorageResult<bool> {
+        self.check()?;
+        self.inner
+            .compare_and_swap(namespace, key, expected, new)
+            .await
+    }
+    async fn clear_namespace(&self, namespace: &str) -> astrid_storage::StorageResult<u64> {
+        self.check()?;
+        self.inner.clear_namespace(namespace).await
+    }
+}
+
+/// A marker store that cannot be read or written leaves signed gap entries
+/// for both the unknown previous run and the current, unprotected run; once
+/// the store works again the marker is written and a clean stop leaves no
+/// gap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unavailable_marker_store_is_recorded_as_gaps() {
+    let log = Arc::new(AuditLog::in_memory(KeyPair::generate()));
+    let session = SessionId::from_uuid(uuid::Uuid::from_u128(0x09b8));
+    let kv = Arc::new(FlakyKv {
+        inner: astrid_storage::MemoryKvStore::new(),
+        failing: std::sync::atomic::AtomicBool::new(true),
+    });
+    let marker = ScopedKvStore::new(
+        Arc::clone(&kv) as Arc<dyn astrid_storage::KvStore>,
+        "system:control:audit-lane",
+    )
+    .expect("marker scope");
+    let alice = PrincipalId::new("alice").expect("alice");
+    let bob = PrincipalId::new("bob").expect("bob");
+
+    let first = KernelAuditSink::with_lane_marker(
+        Arc::clone(&log),
+        session.clone(),
+        policy(10, 128, 4096),
+        marker.clone(),
+    );
+    first.record(
+        &alice,
+        HostAuditEvent::FileRead { path: "/a" },
+        HostAuditOutcome::Allowed,
+    );
+    wait_persisted(&first, 1);
+    let reasons: Vec<String> = log
+        .get_principal_entries(&session, None)
+        .await
+        .expect("system entries")
+        .into_iter()
+        .filter_map(|entry| match entry.action {
+            AuditAction::HostCallGap { reason, .. } => Some(reason),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        reasons,
+        ["lane_marker_unreadable", "lane_marker_unavailable"]
+    );
+    assert!(first.health().degraded);
+
+    kv.failing.store(false, Ordering::SeqCst);
+    first.record(
+        &bob,
+        HostAuditEvent::FileRead { path: "/b" },
+        HostAuditOutcome::Allowed,
+    );
+    wait_persisted(&first, 2);
+    first.shutdown();
+
+    let second = KernelAuditSink::with_lane_marker(
+        Arc::clone(&log),
+        session.clone(),
+        policy(10, 128, 4096),
+        marker,
+    );
+    second.shutdown();
+    assert_eq!(second.health().gaps_recorded, 0);
 }
 
 fn fail_closed_policy(classes: &[&str]) -> HostAuditPolicy {

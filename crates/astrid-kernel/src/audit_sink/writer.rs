@@ -96,9 +96,6 @@ struct Writer<'a> {
     config: &'a WriterConfig,
     runtime: tokio::runtime::Runtime,
     marker: Option<LaneMarker>,
-    /// Chains whose registration failed; retried with the next work item
-    /// rather than at once, so a failing marker store is not hammered.
-    unregistered: Vec<PrincipalId>,
     gaps: Gaps,
 }
 
@@ -121,7 +118,6 @@ pub(super) fn run(shared: &Shared, config: &WriterConfig) {
         config,
         runtime,
         marker: None,
-        unregistered: Vec::new(),
         gaps: Gaps {
             chain_entries: 0,
             system: Vec::new(),
@@ -130,7 +126,7 @@ pub(super) fn run(shared: &Shared, config: &WriterConfig) {
     writer.open_marker();
     let mut drained = true;
     while let Some(work) = writer.next_work() {
-        writer.register(work.register);
+        writer.register(&work.register);
         writer.record_system_gaps();
         if !writer.persist(work.slots) {
             drained = false;
@@ -180,16 +176,13 @@ impl Writer<'_> {
             return;
         };
         let epoch = uuid::Uuid::new_v4().to_string();
-        match LaneMarker::open(&self.runtime, store, epoch, Timestamp::now()) {
-            Ok((marker, duties)) => {
-                self.marker = Some(marker);
-                self.queue_gaps(duties);
-            },
-            Err(error) => {
-                self.shared.note_marker_error();
-                self.shared.note_error(error);
-            },
+        let opened = LaneMarker::open(&self.runtime, store, epoch, Timestamp::now());
+        for error in opened.errors {
+            self.shared.note_marker_error();
+            self.shared.note_error(error);
         }
+        self.marker = Some(opened.marker);
+        self.queue_gaps(opened.duties);
     }
 
     /// Put a gap slot in front of every chain a stopped run registered, and
@@ -259,26 +252,21 @@ impl Writer<'_> {
         }
     }
 
-    /// Add chains to the lane marker before their first entry is written.
+    /// Add chains to the lane marker before their first entry is written,
+    /// and retry an earlier marker write that failed.
     ///
     /// If the marker cannot be written, the entries are still appended: a
     /// crash then leaves no gap entry in those chains, only the system-chain
-    /// gap entry, and health reports the marker error.
-    fn register(&mut self, principals: Vec<PrincipalId>) {
-        self.unregistered.extend(principals);
-        if self.unregistered.is_empty() {
-            return;
-        }
+    /// gap entry, and health reports the marker error. A failed write is
+    /// retried with the next work item rather than at once, so a failing
+    /// marker store is not hammered.
+    fn register(&mut self, principals: &[PrincipalId]) {
         let Some(marker) = self.marker.as_mut() else {
-            self.unregistered.clear();
             return;
         };
-        match marker.register(&self.runtime, &self.unregistered) {
-            Ok(()) => self.unregistered.clear(),
-            Err(error) => {
-                self.shared.note_marker_error();
-                self.shared.note_error(error);
-            },
+        if let Err(error) = marker.register(&self.runtime, principals) {
+            self.shared.note_marker_error();
+            self.shared.note_error(error);
         }
     }
 
@@ -333,6 +321,13 @@ impl Writer<'_> {
 
     /// Append `slots` in order, retrying until durable. Returns `false` when
     /// shutdown gave up on a failing batch.
+    ///
+    /// Retrying the whole batch relies on the append being all-or-nothing.
+    /// It is on the audit backends the kernel uses: the batch is at most
+    /// `host_batch_max` (128) entries, which the audit log commits as one
+    /// atomic KV batch. A backend without atomic batches can report an error
+    /// after committing a prefix; a retry then writes that prefix twice, which
+    /// over-reports but never drops or hides a call.
     fn persist(&mut self, mut slots: Vec<Slot>) -> bool {
         let mut attempt = 0_u32;
         loop {
