@@ -128,6 +128,11 @@ pub(super) fn run(shared: &Shared, config: &WriterConfig) {
         },
     };
     writer.open_marker();
+    // A stopped run that registered no chains owes only system-chain gaps,
+    // which queue no lane work: record them now rather than with the next
+    // host call.
+    writer.record_system_gaps();
+    writer.settle_gaps();
     let mut drained = true;
     while let Some(work) = writer.next_work() {
         writer.register(&work.register);
@@ -234,11 +239,28 @@ impl Writer<'_> {
                     lanes.lifecycle = Lifecycle::Drained;
                     return None;
                 }
-                lanes = self
+                if self.gaps.system.is_empty() {
+                    lanes = self
+                        .shared
+                        .wake
+                        .wait(lanes)
+                        .unwrap_or_else(PoisonError::into_inner);
+                    continue;
+                }
+                // A system-chain gap entry failed and nothing else is queued:
+                // retry it after a pause instead of waiting for a host call.
+                let (guard, waited) = self
                     .shared
                     .wake
-                    .wait(lanes)
+                    .wait_timeout(lanes, MAX_BACKOFF)
                     .unwrap_or_else(PoisonError::into_inner);
+                lanes = guard;
+                if waited.timed_out() {
+                    return Some(Work {
+                        slots: Vec::new(),
+                        register: Vec::new(),
+                    });
+                }
                 continue;
             }
             let now = Instant::now();
