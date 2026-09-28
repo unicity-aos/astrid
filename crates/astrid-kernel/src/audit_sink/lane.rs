@@ -497,7 +497,12 @@ pub(super) enum Lifecycle {
     Open,
     /// Shutdown requested: the writer drains without waiting for the window.
     Draining,
-    /// The writer has stopped; calls are no longer queued.
+    /// The writer drained every queued slot and stopped: every accepted
+    /// record is durable, and calls are no longer queued.
+    Drained,
+    /// The writer has stopped without draining (it died, could not start,
+    /// or gave up on a failing batch at shutdown); calls are no longer
+    /// queued.
     Closed,
     /// Test hook: the writer stopped at once without draining or closing the
     /// lane marker, as if the process had died.
@@ -505,8 +510,8 @@ pub(super) enum Lifecycle {
 }
 
 impl Lifecycle {
-    fn refuses_calls(self) -> bool {
-        matches!(self, Self::Closed | Self::Abandoned)
+    pub(super) fn refuses_calls(self) -> bool {
+        matches!(self, Self::Drained | Self::Closed | Self::Abandoned)
     }
 }
 
@@ -637,19 +642,15 @@ impl Lanes {
 
     /// Queue a record the caller waits for as its own slot behind everything
     /// already queued for its chain. Committed records are bounded by their
-    /// waiting callers, so they may exceed the queue capacity. Returns the
-    /// record when the writer has stopped, so the caller can append it
-    /// another way.
+    /// waiting callers, so they may exceed the queue capacity. The caller
+    /// checks [`Lifecycle::refuses_calls`] first, under the same lock.
     pub(super) fn push_commit(
         &mut self,
         principal: &PrincipalId,
         call: Call,
         commit: CommitSender,
         now: Instant,
-    ) -> Result<(), Box<Call>> {
-        if self.lifecycle.refuses_calls() {
-            return Err(Box::new(call));
-        }
+    ) {
         self.accepted = self.accepted.saturating_add(1);
         self.queued_calls = self.queued_calls.saturating_add(1);
         self.awaited = self.awaited.saturating_add(1);
@@ -661,7 +662,6 @@ impl Lanes {
             },
             now,
         );
-        Ok(())
     }
 
     /// Queue a write-ahead admission. Admissions are bounded by concurrent

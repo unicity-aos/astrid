@@ -186,6 +186,9 @@ struct AuditQueue {
     shared: Arc<Shared>,
     omitted_path_probes: AtomicU64,
     worker: Mutex<Option<JoinHandle<()>>>,
+    /// Serializes committed records appended directly after the lane
+    /// drained, from numbering to append, so they keep call order.
+    direct: tokio::sync::Mutex<()>,
 }
 
 impl AuditQueue {
@@ -221,6 +224,7 @@ impl AuditQueue {
             shared,
             omitted_path_probes: AtomicU64::new(0),
             worker: Mutex::new(worker),
+            direct: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -320,6 +324,17 @@ fn wait_blocking<T>(wait: impl FnOnce() -> T) -> T {
         },
         _ => wait(),
     }
+}
+
+/// Why a committed record was not queued.
+enum CommitRefused {
+    /// The writer drained every queued record and stopped, so the record can
+    /// be appended directly and still follow every earlier entry. Not yet
+    /// numbered.
+    Drained(Box<Call>),
+    /// The writer stopped without draining; queued records are lost and the
+    /// next start records a gap. Carries the HTTP number the record took.
+    Stopped(Option<u64>),
 }
 
 /// Persists capsule per-action host calls onto the kernel's signed audit
@@ -544,25 +559,28 @@ impl KernelAuditSink {
     /// Queue a record the caller waits for, as its own entry behind
     /// everything already queued for its chain; `commit` learns when it is
     /// durable. Numbers an HTTP request like [`enqueue`](Self::enqueue).
-    /// Returns the record when the writer has stopped.
     fn enqueue_commit(
         &self,
         principal: &PrincipalId,
         mut call: Call,
         commit: CommitSender,
-    ) -> (Result<(), Box<Call>>, Option<u64>) {
-        let (queued, sequence) = {
+    ) -> Result<Option<u64>, CommitRefused> {
+        let sequence = {
             let mut lanes = self.queue.shared.lanes();
+            match lanes.lifecycle {
+                Lifecycle::Drained => return Err(CommitRefused::Drained(Box::new(call))),
+                lifecycle if lifecycle.refuses_calls() => {
+                    let sequence = self.stamp_http_sequence(principal, &mut call.action);
+                    return Err(CommitRefused::Stopped(sequence));
+                },
+                _ => {},
+            }
             let sequence = self.stamp_http_sequence(principal, &mut call.action);
-            (
-                lanes.push_commit(principal, call, commit, Instant::now()),
-                sequence,
-            )
+            lanes.push_commit(principal, call, commit, Instant::now());
+            sequence
         };
-        if queued.is_ok() {
-            self.queue.shared.wake.notify_one();
-        }
-        (queued, sequence)
+        self.queue.shared.wake.notify_one();
+        Ok(sequence)
     }
 
     fn record_at(

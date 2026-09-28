@@ -17,7 +17,7 @@ use astrid_crypto::ContentHash;
 use tracing::warn;
 
 use super::lane::{Call, call_entry};
-use super::{KernelAuditSink, truncate_guest_str};
+use super::{CommitRefused, KernelAuditSink, truncate_guest_str};
 
 /// Most provider request ids kept on one HTTP completion.
 const MAX_PROVIDER_REQUEST_IDS: usize = 8;
@@ -242,9 +242,14 @@ impl KernelAuditSink {
     /// entry is durable or when an append attempt of its batch fails. A
     /// failed attempt does not fail the host call: it is logged and reported
     /// as a receipt without an entry id, and the record stays queued, so it
-    /// is still written in its place once the log accepts it. A record that
-    /// arrives after the writer stopped (the queue is drained by then) is
-    /// appended directly, so it is durable before the host call proceeds.
+    /// is still written in its place once the log accepts it.
+    ///
+    /// After the writer drained the lane and stopped (daemon shutdown while
+    /// capsules still run), the record is appended directly, numbered and
+    /// appended under one lock so such records keep call order; they follow
+    /// every entry the lane wrote. After the writer stopped without draining,
+    /// the record is not written: the lane's queued records are lost too, and
+    /// the next start records a gap entry that covers them.
     pub(super) async fn commit_in_order(
         &self,
         principal: &PrincipalId,
@@ -259,35 +264,60 @@ impl KernelAuditSink {
             detail,
             at: Timestamp::now(),
         };
-        let (queued, sequence) = self.enqueue_commit(principal, call, sender);
-        let entry_id = match queued {
-            Err(call) => self.append_directly(principal, *call).await,
-            Ok(()) => match receiver.await {
-                Ok(Ok(entry_id)) => Some(entry_id),
-                Ok(Err(error)) => {
-                    warn!(
-                        security_event = true,
-                        %principal,
-                        %error,
-                        "Durable audit append failed; continuing, the record stays queued"
-                    );
-                    None
-                },
-                Err(_) => {
-                    warn!(
-                        security_event = true,
-                        %principal,
-                        "Audit writer stopped before the record was durable; continuing"
-                    );
-                    None
-                },
+        let sequence = match self.enqueue_commit(principal, call, sender) {
+            Ok(sequence) => sequence,
+            Err(CommitRefused::Drained(call)) => {
+                return self.commit_directly(principal, *call).await;
+            },
+            Err(CommitRefused::Stopped(sequence)) => {
+                {
+                    let mut health = self.queue.shared.health();
+                    health.dropped_after_shutdown = health.dropped_after_shutdown.saturating_add(1);
+                }
+                warn!(
+                    security_event = true,
+                    %principal,
+                    "Audit writer stopped without draining; committed record not recorded"
+                );
+                return HostAuditReceipt {
+                    sequence,
+                    entry_id: None,
+                };
+            },
+        };
+        let entry_id = match receiver.await {
+            Ok(Ok(entry_id)) => Some(entry_id),
+            Ok(Err(error)) => {
+                warn!(
+                    security_event = true,
+                    %principal,
+                    %error,
+                    "Durable audit append failed; continuing, the record stays queued"
+                );
+                None
+            },
+            Err(_) => {
+                warn!(
+                    security_event = true,
+                    %principal,
+                    "Audit writer stopped before the record was durable; continuing"
+                );
+                None
             },
         };
         HostAuditReceipt { sequence, entry_id }
     }
 
-    /// Append a committed record straight to the log, for a record that
-    /// arrives after the lane's writer stopped.
+    /// Number and append a committed record directly, after the lane
+    /// drained. One lock covers both, so direct records keep call order.
+    async fn commit_directly(&self, principal: &PrincipalId, mut call: Call) -> HostAuditReceipt {
+        let _order = self.queue.direct.lock().await;
+        let sequence = self.stamp_http_sequence(principal, &mut call.action);
+        let entry_id = self.append_directly(principal, call).await;
+        HostAuditReceipt { sequence, entry_id }
+    }
+
+    /// Append a committed record straight to the log.
     async fn append_directly(&self, principal: &PrincipalId, call: Call) -> Option<AuditEntryId> {
         let (action, authorization, outcome) = call_entry(call.action, call.outcome, call.detail);
         let appended = self

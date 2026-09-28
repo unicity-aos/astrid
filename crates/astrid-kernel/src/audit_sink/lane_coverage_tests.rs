@@ -663,3 +663,112 @@ async fn commit_after_shutdown_is_appended_directly() {
     assert_eq!(sink.health().dropped_after_shutdown, 0);
     assert!(log.verify_chain(&session).await.expect("verify").valid);
 }
+
+/// Records committed concurrently after the lane drained keep call order:
+/// numbering and the direct append happen under one lock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn direct_commits_after_shutdown_keep_call_order() {
+    let log = Arc::new(AuditLog::in_memory(KeyPair::generate()));
+    let session = SessionId::from_uuid(uuid::Uuid::from_u128(0x0d08));
+    let sink =
+        KernelAuditSink::with_policy(Arc::clone(&log), session.clone(), policy(10, 4096, &[]));
+    sink.shutdown();
+    let p = alice();
+    let mut tasks = Vec::new();
+    for capsule in 0..4 {
+        let handle = sink
+            .attributed(host_actor(&format!("capsule-{capsule}")))
+            .expect("attributed");
+        let p = p.clone();
+        tasks.push(tokio::spawn(async move {
+            for _ in 0..5 {
+                let receipt = handle
+                    .commit(
+                        &p,
+                        HostAuditEvent::HttpRequest(request("api.example.com")),
+                        HostAuditOutcome::Allowed,
+                    )
+                    .await;
+                assert!(receipt.entry_id.is_some());
+            }
+        }));
+    }
+    for task in tasks {
+        task.await.expect("task");
+    }
+    let sequences: Vec<u64> = log
+        .get_principal_entries(&session, Some(&p))
+        .await
+        .unwrap()
+        .iter()
+        .map(|entry| match &entry.action {
+            AuditAction::HttpRequest { sequence, .. } => *sequence,
+            other => panic!("unexpected action {other:?}"),
+        })
+        .collect();
+    assert_eq!(sequences, (1..=20).collect::<Vec<_>>());
+}
+
+/// After the writer stopped without draining, a committed record is not
+/// appended behind the lost queue: the caller continues without an entry id,
+/// and the next start's gap entry is the next entry on the chain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn commit_after_an_unclean_stop_is_left_to_the_gap() {
+    let log = Arc::new(AuditLog::in_memory(KeyPair::generate()));
+    let session = SessionId::from_uuid(uuid::Uuid::from_u128(0x0d09));
+    let marker = marker_store();
+    let p = alice();
+    let first = KernelAuditSink::with_lane_marker(
+        Arc::clone(&log),
+        session.clone(),
+        policy(LONG_WINDOW_MS, 4096, &[]),
+        marker.clone(),
+    );
+    let llm = first.attributed(host_actor("llm")).expect("attributed");
+    let durable = llm
+        .commit(
+            &p,
+            HostAuditEvent::HttpRequest(request("api.example.com")),
+            HostAuditOutcome::Allowed,
+        )
+        .await;
+    assert!(durable.entry_id.is_some());
+    llm.record(
+        &p,
+        HostAuditEvent::FileRead { path: "/queued" },
+        HostAuditOutcome::Allowed,
+    );
+    first.abandon_for_test();
+
+    let late = llm
+        .commit(
+            &p,
+            HostAuditEvent::HttpRequest(request("api.example.com")),
+            HostAuditOutcome::Allowed,
+        )
+        .await;
+    assert_eq!(late.sequence, Some(2), "the number is consumed");
+    assert!(
+        late.entry_id.is_none(),
+        "not appended behind the lost queue"
+    );
+    assert_eq!(first.health().dropped_after_shutdown, 1);
+
+    let second = KernelAuditSink::with_lane_marker(
+        Arc::clone(&log),
+        session.clone(),
+        policy(10, 4096, &[]),
+        marker,
+    );
+    second.shutdown();
+    let entries = log.get_principal_entries(&session, Some(&p)).await.unwrap();
+    assert_eq!(entries.len(), 2, "request, then the gap");
+    assert!(matches!(
+        &entries[0].action,
+        AuditAction::HttpRequest { sequence: 1, .. }
+    ));
+    assert!(matches!(
+        &entries[1].action,
+        AuditAction::HostCallGap { reason, .. } if reason == "unclean_shutdown"
+    ));
+}

@@ -164,7 +164,7 @@ impl Drop for StopOnExit<'_> {
 fn stop(shared: &Shared, reason: &str) {
     let (tickets, commits) = {
         let mut lanes = shared.lanes();
-        if lanes.lifecycle != Lifecycle::Abandoned {
+        if !matches!(lanes.lifecycle, Lifecycle::Abandoned | Lifecycle::Drained) {
             lanes.lifecycle = Lifecycle::Closed;
         }
         (lanes.take_admissions(), lanes.take_commits())
@@ -231,7 +231,7 @@ impl Writer<'_> {
                 if draining {
                     // Refuse further calls in the same critical section that
                     // saw the queue empty, so none is queued after the drain.
-                    lanes.lifecycle = Lifecycle::Closed;
+                    lanes.lifecycle = Lifecycle::Drained;
                     return None;
                 }
                 lanes = self
