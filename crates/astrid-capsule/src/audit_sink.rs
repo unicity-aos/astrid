@@ -15,12 +15,13 @@
 //! # Why bounded asynchronous
 //!
 //! Host calls enqueue a bounded, host-owned record and return without waiting
-//! for an individual storage commit. A dedicated kernel writer coalesces
-//! accepted records and acknowledges persistence through operator health. A
-//! full queue applies explicit backpressure; a dead writer or failed commit is
-//! visible as degraded health. Per-action audit deliberately does NOT route
-//! over the event bus: the bus is broadcast-with-lag-drop, and a droppable
-//! record is not a provable one. The chain append remains the system of record.
+//! for an individual storage commit. A dedicated kernel writer records each
+//! principal's calls in call order, coalesces consecutive calls losslessly,
+//! and writes a signed loss record for calls a full queue could not hold, so
+//! a gap is visible on the chain itself. Per-action audit deliberately does
+//! NOT route over the event bus: the bus is broadcast-with-lag-drop, and a
+//! droppable record is not a provable one. The chain append remains the
+//! system of record.
 
 /// A sensitive host-call action being reported to the audit sink.
 ///
@@ -100,10 +101,12 @@ pub enum HostAuditOutcome<'a> {
 ///
 /// Implementations **MUST** enqueue a bounded, owned copy before returning.
 /// They may decouple host-call latency from storage commit, but must not drop
-/// an accepted record. Queue saturation supplies bounded backpressure, and a
-/// worker or persistence failure must be exposed through the implementation's
-/// operator health surface. Graceful shutdown must drain accepted records
-/// before closing the authoritative audit projection.
+/// an accepted record without a trace on the chain: a call that cannot be
+/// recorded individually must still be counted by a signed loss record.
+/// Records of one principal must reach the chain in call order. A worker or
+/// persistence failure must be exposed through the implementation's operator
+/// health surface. Graceful shutdown must drain accepted records before
+/// closing the authoritative audit projection.
 ///
 /// Implementations **MUST** stamp the `principal` argument exactly as
 /// passed. The host fn derives that principal from trusted, host-populated
