@@ -7,12 +7,14 @@
 //! under the audit log's durable append lock, so the chain position and the
 //! signature are assigned where they become durable. A failed batch is
 //! retried as-is before anything queued behind it is taken, so a failure
-//! never reorders entries.
+//! never reorders entries. Callers waiting for a committed record learn its
+//! entry id when the batch is durable, or the error when an attempt fails; in
+//! that case the record stays in the batch and is retried with it.
 
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use astrid_audit::AuditLog;
+use astrid_audit::{AuditEntryId, AuditLog};
 use astrid_core::{PrincipalId, SessionId, Timestamp};
 use astrid_storage::ScopedKvStore;
 use tracing::warn;
@@ -75,6 +77,8 @@ pub(super) struct WriterConfig {
     pub(super) session: SessionId,
     pub(super) policy: HostAuditPolicy,
     pub(super) marker: Option<ScopedKvStore>,
+    /// Identifier of this lane run, also the `run_id` of its HTTP entries.
+    pub(super) epoch: String,
 }
 
 /// One unit of writer work.
@@ -155,17 +159,21 @@ impl Drop for StopOnExit<'_> {
     }
 }
 
-/// Refuse further calls and fail every waiting admission.
+/// Refuse further calls, fail every waiting admission and answer every
+/// waiting committed record.
 fn stop(shared: &Shared, reason: &str) {
-    let tickets = {
+    let (tickets, commits) = {
         let mut lanes = shared.lanes();
         if lanes.lifecycle != Lifecycle::Abandoned {
             lanes.lifecycle = Lifecycle::Closed;
         }
-        lanes.take_admissions()
+        (lanes.take_admissions(), lanes.take_commits())
     };
     for ticket in tickets {
         ticket.resolve(Err(reason.to_owned()));
+    }
+    for commit in commits {
+        let _ = commit.send(Err(reason.to_owned()));
     }
     shared.health().worker_alive = false;
 }
@@ -175,8 +183,12 @@ impl Writer<'_> {
         let Some(store) = self.config.marker.clone() else {
             return;
         };
-        let epoch = uuid::Uuid::new_v4().to_string();
-        let opened = LaneMarker::open(&self.runtime, store, epoch, Timestamp::now());
+        let opened = LaneMarker::open(
+            &self.runtime,
+            store,
+            self.config.epoch.clone(),
+            Timestamp::now(),
+        );
         for error in opened.errors {
             self.shared.note_marker_error();
             self.shared.note_error(error);
@@ -341,17 +353,20 @@ impl Writer<'_> {
             let results = self
                 .runtime
                 .block_on(self.config.audit_log.append_batch_with_principal(requests));
-            let error = if results.len() == slots.len() {
+            let appended: Result<Vec<AuditEntryId>, String> = if results.len() == slots.len() {
                 results
                     .into_iter()
-                    .find_map(Result::err)
-                    .map(|error| error.to_string())
+                    .collect::<Result<_, _>>()
+                    .map_err(|error| error.to_string())
             } else {
-                Some("audit batch returned a partial result".to_owned())
+                Err("audit batch returned a partial result".to_owned())
             };
-            let Some(error) = error else {
-                self.settle(&slots);
-                return true;
+            let error = match appended {
+                Ok(ids) => {
+                    self.settle(slots, ids);
+                    return true;
+                },
+                Err(error) => error,
             };
             attempt = attempt.saturating_add(1);
             {
@@ -361,6 +376,7 @@ impl Writer<'_> {
             self.shared
                 .note_error(format!("host-audit batch append failed: {error}"));
             self.refuse_admissions(&mut slots, &error);
+            self.answer_commits(&mut slots, &error);
             if !self.backoff(attempt) {
                 return false;
             }
@@ -382,6 +398,18 @@ impl Writer<'_> {
         tickets.extend(self.shared.lanes().take_admissions());
         for ticket in tickets {
             ticket.resolve(Err(error.to_owned()));
+        }
+    }
+
+    /// A committed record's caller must not wait out a failing log either:
+    /// answer every committed record in the failed batch and in the queue
+    /// with the error. The records stay queued and are still written, in
+    /// their place, once an attempt succeeds.
+    fn answer_commits(&self, slots: &mut [Slot], error: &str) {
+        let mut commits: Vec<_> = slots.iter_mut().filter_map(Slot::take_commit).collect();
+        commits.extend(self.shared.lanes().take_commits());
+        for commit in commits {
+            let _ = commit.send(Err(error.to_owned()));
         }
     }
 
@@ -419,16 +447,20 @@ impl Writer<'_> {
         lanes.lifecycle != Lifecycle::Abandoned
     }
 
-    /// Account a durable batch and release its admissions.
-    fn settle(&mut self, slots: &[Slot]) {
+    /// Account a durable batch, release its admissions and tell committed
+    /// records' callers their entry ids.
+    fn settle(&mut self, slots: Vec<Slot>, ids: Vec<AuditEntryId>) {
         let settled: u64 = slots.iter().map(Slot::calls).sum();
         {
             let mut lanes = self.shared.lanes();
             lanes.queued_calls = lanes.queued_calls.saturating_sub(settled);
         }
         let mut health = self.shared.health();
-        for slot in slots {
+        for (mut slot, id) in slots.into_iter().zip(ids) {
             let calls = slot.calls();
+            if let Some(commit) = slot.take_commit() {
+                let _ = commit.send(Ok(id));
+            }
             match &slot.kind {
                 SlotKind::Run { .. } => {
                     health.persisted = health.persisted.saturating_add(calls);
@@ -437,6 +469,9 @@ impl Writer<'_> {
                         .saturating_add(calls.saturating_sub(1));
                 },
                 SlotKind::Loss { .. } => health.lost = health.lost.saturating_add(calls),
+                SlotKind::Record { .. } => {
+                    health.persisted = health.persisted.saturating_add(calls);
+                },
                 SlotKind::Gap { .. } => {
                     health.gaps_recorded = health.gaps_recorded.saturating_add(1);
                     self.gaps.chain_entries = self.gaps.chain_entries.saturating_sub(1);

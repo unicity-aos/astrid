@@ -1,5 +1,5 @@
 use super::*;
-use crate::entry::{AuditEntry, AuditOutcome, AuthorizationProof};
+use crate::entry::{AuditEntry, AuditOutcome, AuthorizationProof, CapsuleActor};
 use astrid_core::{PrincipalId, SessionId};
 use astrid_crypto::KeyPair;
 use chrono::{TimeZone, Utc};
@@ -11,6 +11,7 @@ fn at(secs: i64, nanos: u32) -> Timestamp {
 fn read(path: &str) -> AuditAction {
     AuditAction::FileRead {
         path: path.to_owned(),
+        actor: None,
     }
 }
 
@@ -61,6 +62,7 @@ fn call_digest_binds_every_field() {
     let base_action = AuditAction::NetConnect {
         host: "example.com".to_owned(),
         port: 443,
+        actor: None,
     };
     let base = HostCallRef {
         action: &base_action,
@@ -73,6 +75,7 @@ fn call_digest_binds_every_field() {
     let other_port = AuditAction::NetConnect {
         host: "example.com".to_owned(),
         port: 444,
+        actor: None,
     };
     let later = at(10, 1);
     let variants = [
@@ -118,23 +121,29 @@ fn every_host_call_class_is_listed() {
         AuditAction::FileWrite {
             path: "/p".to_owned(),
             content_hash: ContentHash::zero(),
+            actor: None,
         },
         AuditAction::FileDelete {
             path: "/p".to_owned(),
+            actor: None,
         },
         AuditAction::NetConnect {
             host: "h".to_owned(),
             port: 1,
+            actor: None,
         },
         AuditAction::NetBind {
             addr: "a".to_owned(),
+            actor: None,
         },
         AuditAction::NetAccept {
             local_addr: "l".to_owned(),
             peer_addr: "p".to_owned(),
+            actor: None,
         },
         AuditAction::ProcessSpawn {
             command: "c".to_owned(),
+            actor: None,
         },
     ];
     let classes: Vec<_> = actions
@@ -151,6 +160,7 @@ fn calls() -> Vec<(AuditAction, HostCallOutcome, &'static str, Timestamp)> {
         (
             AuditAction::ProcessSpawn {
                 command: "ls".to_owned(),
+                actor: None,
             },
             HostCallOutcome::Ok,
             "",
@@ -233,6 +243,7 @@ fn summary_is_covered_by_the_entry_signature() {
         PrincipalId::new("alice").expect("principal"),
         AuditAction::HostCallRun {
             calls: summary_of(&calls),
+            actor: Some(actor("fetcher")),
         },
         AuthorizationProof::System {
             reason: "test".to_owned(),
@@ -247,12 +258,177 @@ fn summary_is_covered_by_the_entry_signature() {
     let mut decoded: AuditEntry = serde_json::from_str(&json).expect("deserialize");
     assert!(decoded.verify_signature().is_ok(), "round trip keeps bytes");
 
-    let AuditAction::HostCallRun { calls: summary } = &mut decoded.action else {
-        panic!("unexpected action {:?}", decoded.action);
+    let mut recounted = decoded.clone();
+    let AuditAction::HostCallRun { calls: summary, .. } = &mut recounted.action else {
+        panic!("unexpected action {:?}", recounted.action);
     };
     summary.count = 2;
     assert!(
-        decoded.verify_signature().is_err(),
+        recounted.verify_signature().is_err(),
         "the count must be signed"
     );
+
+    let AuditAction::HostCallRun {
+        actor: run_actor, ..
+    } = &mut decoded.action
+    else {
+        panic!("unexpected action {:?}", decoded.action);
+    };
+    *run_actor = Some(actor("other"));
+    assert!(
+        decoded.verify_signature().is_err(),
+        "the run's capsule must be signed"
+    );
+}
+
+fn actor(capsule_id: &str) -> CapsuleActor {
+    CapsuleActor {
+        capsule_id: capsule_id.to_owned(),
+        wasm_hash: Some(ContentHash::hash(capsule_id.as_bytes())),
+    }
+}
+
+fn attributed_read(path: &str, actor: Option<CapsuleActor>) -> AuditAction {
+    AuditAction::FileRead {
+        path: path.to_owned(),
+        actor,
+    }
+}
+
+/// An attributed call appends its actor after the documented layout; an
+/// unattributed call's digest is unchanged, so the known answer above holds.
+#[test]
+fn call_digest_binds_the_actor() {
+    let time = at(1_700_000_000, 123_456_789);
+    let digest_of = |action: &AuditAction| {
+        host_call_digest(&HostCallRef {
+            action,
+            outcome: HostCallOutcome::Failed,
+            detail: "NotFound",
+            at: &time,
+        })
+        .expect("host call")
+    };
+    let fetcher = actor("fetcher");
+    let attributed = digest_of(&attributed_read("/w/a", Some(fetcher.clone())));
+
+    let mut bytes = Vec::new();
+    for field in [HOST_CALL_DIGEST_DOMAIN.as_bytes(), b"file_read", b"/w/a"] {
+        bytes.extend_from_slice(&(field.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(field);
+    }
+    bytes.push(1);
+    bytes.extend_from_slice(&8_u64.to_be_bytes());
+    bytes.extend_from_slice(b"NotFound");
+    bytes.extend_from_slice(&time.0.timestamp().to_be_bytes());
+    bytes.extend_from_slice(&time.0.timestamp_subsec_nanos().to_be_bytes());
+    bytes.push(1);
+    bytes.extend_from_slice(&7_u64.to_be_bytes());
+    bytes.extend_from_slice(b"fetcher");
+    bytes.push(1);
+    bytes.extend_from_slice(fetcher.wasm_hash.expect("hash").as_bytes());
+    assert_eq!(*attributed.as_bytes(), *blake3::hash(&bytes).as_bytes());
+
+    assert_eq!(
+        *digest_of(&attributed_read("/w/a", None)).as_bytes(),
+        manual_file_read_digest("/w/a", 1, "NotFound", &time)
+    );
+    let other = digest_of(&attributed_read("/w/a", Some(actor("other"))));
+    let hashless = digest_of(&attributed_read(
+        "/w/a",
+        Some(CapsuleActor {
+            capsule_id: "fetcher".to_owned(),
+            wasm_hash: None,
+        }),
+    ));
+    assert_ne!(attributed, other, "another capsule");
+    assert_ne!(attributed, hashless, "another component");
+}
+
+fn http_request(sequence: u64, actor: Option<CapsuleActor>) -> AuditAction {
+    AuditAction::HttpRequest {
+        sequence,
+        run_id: "run".to_owned(),
+        method: "POST".to_owned(),
+        host: "api.example.com".to_owned(),
+        port: 443,
+        path_hash: ContentHash::hash(b"/v1"),
+        headers_hash: ContentHash::hash(b"h"),
+        body_hash: ContentHash::hash(b"b"),
+        body_len: 1,
+        redirect_hop: 0,
+        injected_secrets: Vec::new(),
+        actor,
+    }
+}
+
+/// A record that is not a host call has a digest over its type tag and its
+/// JSON, and a loss summary over mixed records recomputes from them.
+#[test]
+fn record_digest_follows_the_documented_layout() {
+    let time = at(200, 5);
+    let action = http_request(7, Some(actor("llm")));
+    let call = HostCallRef {
+        action: &action,
+        outcome: HostCallOutcome::Denied,
+        detail: "egress denied",
+        at: &time,
+    };
+    assert!(host_call_digest(&call).is_none());
+    assert_eq!(lane_record_class(&action), "http_request");
+    let digest = host_record_digest(&call).expect("record digest");
+
+    let json = serde_json::to_vec(&action).expect("json");
+    let mut bytes = Vec::new();
+    for field in [
+        HOST_RECORD_DIGEST_DOMAIN.as_bytes(),
+        b"http_request".as_slice(),
+        json.as_slice(),
+    ] {
+        bytes.extend_from_slice(&(field.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(field);
+    }
+    bytes.push(2);
+    bytes.extend_from_slice(&13_u64.to_be_bytes());
+    bytes.extend_from_slice(b"egress denied");
+    bytes.extend_from_slice(&time.0.timestamp().to_be_bytes());
+    bytes.extend_from_slice(&time.0.timestamp_subsec_nanos().to_be_bytes());
+    assert_eq!(*digest.as_bytes(), *blake3::hash(&bytes).as_bytes());
+    assert_eq!(lane_call_digest(&call), Some(digest));
+
+    let other_actor = http_request(7, Some(actor("other")));
+    let other_sequence = http_request(8, Some(actor("llm")));
+    for other in [&other_actor, &other_sequence] {
+        assert_ne!(
+            host_record_digest(&HostCallRef {
+                action: other,
+                ..call
+            }),
+            Some(digest)
+        );
+    }
+
+    let read = attributed_read("/a", Some(actor("llm")));
+    let mixed = [
+        HostCallRef {
+            action: &read,
+            outcome: HostCallOutcome::Ok,
+            detail: "",
+            at: &time,
+        },
+        call,
+    ];
+    let mut fold = HostCallFold::new();
+    for call in &mixed {
+        fold.push(&lane_call_digest(call).expect("digest"));
+    }
+    let summary = HostCallSummary {
+        count: fold.count(),
+        first_at: time,
+        last_at: time,
+        fold: fold.value(),
+        tally: Vec::new(),
+    };
+    assert!(summary.matches_calls(&mixed));
+    assert!(!summary.matches_calls(&[mixed[1], mixed[0]]), "reordered");
 }

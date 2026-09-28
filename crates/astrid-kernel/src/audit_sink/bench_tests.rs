@@ -85,7 +85,10 @@ fn mixed_allowed(sink: &KernelAuditSink, principal: &PrincipalId, index: usize) 
     let path = format!("/bench/{index}");
     let event = match index % 3 {
         0 => HostAuditEvent::FileRead { path: &path },
-        1 => HostAuditEvent::FileWrite { path: &path },
+        1 => HostAuditEvent::FileWrite {
+            path: &path,
+            content_hash: None,
+        },
         _ => HostAuditEvent::NetConnect {
             host: "example.com",
             port: 443,

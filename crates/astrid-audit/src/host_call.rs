@@ -2,8 +2,8 @@
 //!
 //! Capsule host calls (fs, net, process) reach the audit chain through an
 //! ordered, per-chain lane in the kernel. The lane records consecutive calls
-//! of one principal as a single entry and accounts for calls it could not
-//! record individually. The types here are the signed payload of those
+//! of one principal and one capsule as a single entry and accounts for calls
+//! it could not record individually. The types here are the signed payload of those
 //! entries; they live in this crate so a verifier can check them without the
 //! kernel.
 //!
@@ -33,13 +33,45 @@
 //! Strings are the values a single-call entry would store, i.e. after the
 //! kernel bounds guest-controlled strings.
 //!
+//! A call attributed to a capsule (the action's `actor`, see
+//! [`CapsuleActor`](crate::CapsuleActor)) appends its actor after the event
+//! time; an unattributed call appends nothing, so its digest is the layout
+//! above:
+//!
+//! ```text
+//!  || u8(1) || lp(capsule_id) || u8(0)                        // no wasm hash
+//!  || u8(1) || lp(capsule_id) || u8(1) || wasm_hash (32 bytes)
+//! ```
+//!
+//! # Other lane records
+//!
+//! The lane also carries records that are not host calls: HTTP requests and
+//! completions, tool calls and approval decisions. Each is written as its own
+//! entry and never shares a run, but one that meets a full queue is accounted
+//! in a loss entry like a host call, with this digest:
+//!
+//! ```text
+//! record_digest = BLAKE3(
+//!     lp("astrid.audit.host-record.v1")
+//!  || lp(type)                    // the action's serialized `type` tag
+//!  || lp(action)                  // the action's JSON, as an entry stores it
+//!  || u8(outcome) || lp(detail)
+//!  || i64_be(unix_seconds) || u32_be(subsec_nanos)
+//! )
+//! ```
+//!
+//! The action JSON includes the record's actor. Its tally class is the `type`
+//! tag (see [`lane_record_class`]).
+//!
 //! # Fold
 //!
-//! A run of `n` calls commits to all of them, in call order:
+//! A run or loss entry of `n` calls commits to all of them, in call order.
+//! `digest_i` is the `call_digest` of a host call, or the `record_digest` of
+//! another record (only a loss entry holds those):
 //!
 //! ```text
 //! fold_0 = 32 zero bytes
-//! fold_i = BLAKE3(lp("astrid.audit.host-call-fold.v1") || fold_{i-1} || call_digest_i)
+//! fold_i = BLAKE3(lp("astrid.audit.host-call-fold.v1") || fold_{i-1} || digest_i)
 //! ```
 //!
 //! [`HostCallSummary::fold`] is `fold_n` and [`HostCallSummary::count`] is
@@ -54,6 +86,8 @@ use crate::entry::AuditAction;
 
 /// Domain separator of a single call's digest.
 pub const HOST_CALL_DIGEST_DOMAIN: &str = "astrid.audit.host-call.v1";
+/// Domain separator of the digest of a lane record that is not a host call.
+pub const HOST_RECORD_DIGEST_DOMAIN: &str = "astrid.audit.host-record.v1";
 /// Domain separator of one fold step.
 pub const HOST_CALL_FOLD_DOMAIN: &str = "astrid.audit.host-call-fold.v1";
 
@@ -93,14 +127,18 @@ impl HostCallOutcome {
     }
 }
 
-/// Calls of one class and outcome inside a [`HostCallSummary`].
+/// Calls of one class, outcome and actor inside a [`HostCallSummary`].
+///
+/// A run holds the calls of one capsule only. A loss entry may account for
+/// calls of several capsules; each keeps its own tally, whose `first` action
+/// names the capsule.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostCallTally {
     /// Host-call class (one of [`HOST_CALL_CLASSES`]).
     pub class: String,
     /// Outcome shared by the counted calls.
     pub outcome: HostCallOutcome,
-    /// Number of calls of this class and outcome.
+    /// Number of calls of this class, outcome and actor.
     pub count: u64,
     /// The first such call, as a single-call entry would record its action.
     pub first: AuditAction,
@@ -147,7 +185,7 @@ impl HostCallSummary {
     pub fn matches_calls(&self, calls: &[HostCallRef<'_>]) -> bool {
         let mut fold = HostCallFold::new();
         for call in calls {
-            let Some(digest) = host_call_digest(call) else {
+            let Some(digest) = lane_call_digest(call) else {
                 return false;
             };
             fold.push(&digest);
@@ -233,33 +271,98 @@ pub fn host_call_digest(call: &HostCallRef<'_>) -> Option<ContentHash> {
     write_lp(&mut hasher, HOST_CALL_DIGEST_DOMAIN.as_bytes());
     write_lp(&mut hasher, class.as_bytes());
     match call.action {
-        AuditAction::FileRead { path } | AuditAction::FileDelete { path } => {
+        AuditAction::FileRead { path, .. } | AuditAction::FileDelete { path, .. } => {
             write_lp(&mut hasher, path.as_bytes());
         },
-        AuditAction::FileWrite { path, content_hash } => {
+        AuditAction::FileWrite {
+            path, content_hash, ..
+        } => {
             write_lp(&mut hasher, path.as_bytes());
             hasher.update(content_hash.as_bytes());
         },
-        AuditAction::NetConnect { host, port } => {
+        AuditAction::NetConnect { host, port, .. } => {
             write_lp(&mut hasher, host.as_bytes());
             hasher.update(&port.to_be_bytes());
         },
-        AuditAction::NetBind { addr } => write_lp(&mut hasher, addr.as_bytes()),
+        AuditAction::NetBind { addr, .. } => write_lp(&mut hasher, addr.as_bytes()),
         AuditAction::NetAccept {
             local_addr,
             peer_addr,
+            ..
         } => {
             write_lp(&mut hasher, local_addr.as_bytes());
             write_lp(&mut hasher, peer_addr.as_bytes());
         },
-        AuditAction::ProcessSpawn { command } => write_lp(&mut hasher, command.as_bytes()),
+        AuditAction::ProcessSpawn { command, .. } => write_lp(&mut hasher, command.as_bytes()),
         _ => return None,
     }
+    write_tail(&mut hasher, call);
+    if let Some(actor) = call.action.actor() {
+        hasher.update(&[1]);
+        write_lp(&mut hasher, actor.capsule_id.as_bytes());
+        match &actor.wasm_hash {
+            Some(hash) => {
+                hasher.update(&[1]);
+                hasher.update(hash.as_bytes());
+            },
+            None => {
+                hasher.update(&[0]);
+            },
+        }
+    }
+    Some(ContentHash::from(*hasher.finalize().as_bytes()))
+}
+
+/// Serialized `type` tag of an action.
+#[derive(Deserialize)]
+struct TypeTag {
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+/// Tally class of a lane record: the host-call class of a host call, else the
+/// action's serialized `type` tag (for example `http_request`).
+#[must_use]
+pub fn lane_record_class(action: &AuditAction) -> String {
+    if let Some(class) = host_call_class(action) {
+        return class.to_owned();
+    }
+    serde_json::to_vec(action)
+        .ok()
+        .and_then(|json| serde_json::from_slice::<TypeTag>(&json).ok())
+        .map_or_else(|| "unknown".to_owned(), |tag| tag.kind)
+}
+
+/// Digest of a lane record that is not a host call (see the module docs), or
+/// `None` for a host call, whose digest is [`host_call_digest`].
+#[must_use]
+pub fn host_record_digest(call: &HostCallRef<'_>) -> Option<ContentHash> {
+    if host_call_class(call.action).is_some() {
+        return None;
+    }
+    let json = serde_json::to_vec(call.action).ok()?;
+    let tag = serde_json::from_slice::<TypeTag>(&json).ok()?;
+    let mut hasher = blake3::Hasher::new();
+    write_lp(&mut hasher, HOST_RECORD_DIGEST_DOMAIN.as_bytes());
+    write_lp(&mut hasher, tag.kind.as_bytes());
+    write_lp(&mut hasher, &json);
+    write_tail(&mut hasher, call);
+    Some(ContentHash::from(*hasher.finalize().as_bytes()))
+}
+
+/// Digest of any record the lane folds: [`host_call_digest`] for a host call,
+/// [`host_record_digest`] for any other record.
+#[must_use]
+pub fn lane_call_digest(call: &HostCallRef<'_>) -> Option<ContentHash> {
+    host_call_digest(call).or_else(|| host_record_digest(call))
+}
+
+/// Outcome, detail and event time, shared by both digests.
+fn write_tail(hasher: &mut blake3::Hasher, call: &HostCallRef<'_>) {
     hasher.update(&[call.outcome.code()]);
-    write_lp(&mut hasher, call.detail.as_bytes());
+    write_lp(hasher, call.detail.as_bytes());
     hasher.update(&call.at.0.timestamp().to_be_bytes());
     hasher.update(&call.at.0.timestamp_subsec_nanos().to_be_bytes());
-    Some(ContentHash::from(*hasher.finalize().as_bytes()))
 }
 
 fn write_lp(hasher: &mut blake3::Hasher, bytes: &[u8]) {

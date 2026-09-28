@@ -5,25 +5,35 @@
 //! the writer only ever removes slots from the front. A slot becomes one
 //! signed entry, so append order equals call order.
 //!
-//! Consecutive calls fold into the chain's tail slot while it is still
-//! queued: allowed and failed calls of any class share one run, and identical
-//! denials share one run. A different denial, a write-ahead admission or a
-//! loss closes the run. Folding needs no queue capacity.
+//! Consecutive host calls of one capsule fold into the chain's tail slot
+//! while it is still queued: allowed and failed calls of any class share one
+//! run, and identical denials share one run. The capsule (the call's actor) is
+//! part of the run key, so a run never spans capsules. A call of another
+//! capsule, a different denial, a record that is not a host call, a
+//! write-ahead admission or a loss closes the run. Folding needs no queue
+//! capacity.
 //!
-//! When the queue is full, a call that cannot fold into the tail slot goes
-//! into a loss slot at the tail of its chain instead. Later calls fold into
+//! Records that are not host calls (HTTP exchanges, tool calls, approval
+//! decisions) never fold: each is its own slot and entry. A committed record
+//! also carries a sender the writer answers once its entry is durable.
+//!
+//! When the queue is full, a record that cannot fold into the tail slot goes
+//! into a loss slot at the tail of its chain instead. Later records fold into
 //! that loss slot while the queue stays full, so each chain holds at most one
-//! loss slot beyond capacity and memory stays bounded.
+//! loss slot beyond capacity and memory stays bounded. The loss tally keeps
+//! each capsule's calls apart. Committed records and admissions are never
+//! lost to a full queue: their callers wait for them, which bounds them.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use astrid_audit::host_call::{
     HostCallFold, HostCallOutcome, HostCallRef, HostCallSummary, HostCallTally, host_call_class,
-    host_call_digest,
+    lane_call_digest, lane_record_class,
 };
-use astrid_audit::{AuditAction, AuditOutcome, AuthorizationProof};
+use astrid_audit::{AuditAction, AuditEntryId, AuditOutcome, AuthorizationProof, CapsuleActor};
 use astrid_core::{PrincipalId, SessionId, Timestamp};
 use astrid_crypto::ContentHash;
 
@@ -36,7 +46,12 @@ const LANE_ACCOUNTING_REASON: &str = "host-audit lane accounting";
 /// Loss reason for calls that met a full queue.
 pub(super) const QUEUE_FULL: &str = "queue_full";
 
-/// One host call, as a single-call entry would record it.
+/// Tells a committed record's caller its entry id once the entry is durable,
+/// or why the append failed.
+pub(super) type CommitSender = tokio::sync::oneshot::Sender<Result<AuditEntryId, String>>;
+
+/// One host call or other lane record, as a single-call entry would record
+/// it.
 pub(super) struct Call {
     pub(super) action: AuditAction,
     pub(super) outcome: HostCallOutcome,
@@ -47,13 +62,26 @@ pub(super) struct Call {
 
 impl Call {
     fn digest(&self) -> ContentHash {
-        host_call_digest(&HostCallRef {
+        lane_call_digest(&HostCallRef {
             action: &self.action,
             outcome: self.outcome,
             detail: &self.detail,
             at: &self.at,
         })
         .unwrap_or_else(ContentHash::zero)
+    }
+
+    /// Whether this is a host call, which may share a run.
+    fn is_host_call(&self) -> bool {
+        host_call_class(&self.action).is_some()
+    }
+
+    /// Tally class: the host-call class, or the record's type tag.
+    fn class(&self) -> Cow<'static, str> {
+        host_call_class(&self.action).map_or_else(
+            || Cow::Owned(lane_record_class(&self.action)),
+            Cow::Borrowed,
+        )
     }
 
     fn run_key(&self) -> RunKey {
@@ -67,12 +95,12 @@ impl Call {
     }
 }
 
-/// Which calls may share a run.
+/// Which calls may share a run, besides having the same actor.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum RunKey {
     /// Allowed and failed calls of any class.
     Calls,
-    /// Denials with this action and reason.
+    /// Denials with this action (actor included) and reason.
     Denied(ContentHash),
 }
 
@@ -107,17 +135,17 @@ impl Summary {
             self.failed = self.failed.saturating_add(1);
         }
         self.last_at = call.at;
-        let class = host_call_class(&call.action).unwrap_or("unknown");
-        if let Some(tally) = self
-            .tally
-            .iter_mut()
-            .find(|tally| tally.class == class && tally.outcome == call.outcome)
-        {
+        let class = call.class();
+        if let Some(tally) = self.tally.iter_mut().find(|tally| {
+            tally.class == class
+                && tally.outcome == call.outcome
+                && tally.first.actor() == call.action.actor()
+        }) {
             tally.count = tally.count.saturating_add(1);
             return;
         }
         self.tally.push(HostCallTally {
-            class: class.to_owned(),
+            class: class.into_owned(),
             outcome: call.outcome,
             count: 1,
             first: call.action,
@@ -143,18 +171,30 @@ impl Summary {
     fn single(&self) -> Option<(AuditAction, AuthorizationProof, AuditOutcome)> {
         let tally = self.tally.first()?;
         let detail = tally.first_detail.clone().unwrap_or_default();
-        let (authorization, outcome) = match tally.outcome {
-            HostCallOutcome::Ok => (manifest_gated(), AuditOutcome::success()),
-            HostCallOutcome::Failed => (manifest_gated(), AuditOutcome::failure(detail)),
-            HostCallOutcome::Denied => (
-                AuthorizationProof::Denied {
-                    reason: detail.clone(),
-                },
-                AuditOutcome::failure(detail),
-            ),
-        };
-        Some((tally.first.clone(), authorization, outcome))
+        Some(call_entry(tally.first.clone(), tally.outcome, detail))
     }
+}
+
+/// The entry of one record: a manifest-gated (or, for tool calls and
+/// approvals, the matching system reason) authorization for an allowed or
+/// failed record, a denial otherwise.
+fn call_entry(
+    action: AuditAction,
+    outcome: HostCallOutcome,
+    detail: String,
+) -> (AuditAction, AuthorizationProof, AuditOutcome) {
+    let (authorization, outcome) = match outcome {
+        HostCallOutcome::Ok => (manifest_gated(), AuditOutcome::success()),
+        HostCallOutcome::Failed => (manifest_gated(), AuditOutcome::failure(detail)),
+        HostCallOutcome::Denied => (
+            AuthorizationProof::Denied {
+                reason: detail.clone(),
+            },
+            AuditOutcome::failure(detail),
+        ),
+    };
+    let authorization = super::coverage::authorization(&action, authorization);
+    (action, authorization, outcome)
 }
 
 fn manifest_gated() -> AuthorizationProof {
@@ -254,10 +294,20 @@ impl AdmitTicket {
 
 /// What a slot becomes on the chain.
 pub(super) enum SlotKind {
-    /// Consecutive calls sharing a run key.
-    Run { key: RunKey, calls: Summary },
-    /// Calls that met a full queue.
+    /// Consecutive host calls of one actor sharing a run key.
+    Run {
+        key: RunKey,
+        actor: Option<CapsuleActor>,
+        calls: Summary,
+    },
+    /// Records that met a full queue.
     Loss { calls: Summary },
+    /// A record that is its own entry; `commit` is answered once it is
+    /// durable (or its batch failed).
+    Record {
+        call: Box<Call>,
+        commit: Option<CommitSender>,
+    },
     /// Write-ahead entry of a fail-closed call.
     Admit {
         action: AuditAction,
@@ -288,22 +338,40 @@ pub(super) type AppendRequest = (
 );
 
 impl Slot {
-    fn is_admission(&self) -> bool {
-        matches!(self.kind, SlotKind::Admit { .. })
+    /// Whether a caller waits for this slot: an admission, or a committed
+    /// record whose caller has not been answered yet.
+    fn is_awaited(&self) -> bool {
+        matches!(
+            self.kind,
+            SlotKind::Admit { .. }
+                | SlotKind::Record {
+                    commit: Some(_),
+                    ..
+                }
+        )
     }
 
-    /// Calls this slot records (run) or accounts for (loss).
+    /// Calls this slot records (run, record) or accounts for (loss).
     pub(super) fn calls(&self) -> u64 {
         match &self.kind {
             SlotKind::Run { calls, .. } | SlotKind::Loss { calls } => calls.count(),
+            SlotKind::Record { .. } => 1,
             SlotKind::Admit { .. } | SlotKind::Gap { .. } => 0,
+        }
+    }
+
+    /// Take the sender of a committed record whose caller is still waiting.
+    pub(super) fn take_commit(&mut self) -> Option<CommitSender> {
+        match &mut self.kind {
+            SlotKind::Record { commit, .. } => commit.take(),
+            _ => None,
         }
     }
 
     /// The signed entry this slot becomes.
     pub(super) fn request(&self, session: &SessionId) -> AppendRequest {
         let (action, authorization, outcome) = match &self.kind {
-            SlotKind::Run { key, calls } => run_entry(*key, calls),
+            SlotKind::Run { key, actor, calls } => run_entry(*key, actor.as_ref(), calls),
             SlotKind::Loss { calls } => (
                 AuditAction::HostCallLoss {
                     calls: calls.signed(),
@@ -315,6 +383,9 @@ impl Slot {
                     calls.count()
                 )),
             ),
+            SlotKind::Record { call, .. } => {
+                call_entry(call.action.clone(), call.outcome, call.detail.clone())
+            },
             SlotKind::Admit { action, .. } => (
                 AuditAction::HostCallAdmitted {
                     call: Box::new(action.clone()),
@@ -338,7 +409,11 @@ impl Slot {
     }
 }
 
-fn run_entry(key: RunKey, calls: &Summary) -> (AuditAction, AuthorizationProof, AuditOutcome) {
+fn run_entry(
+    key: RunKey,
+    actor: Option<&CapsuleActor>,
+    calls: &Summary,
+) -> (AuditAction, AuthorizationProof, AuditOutcome) {
     if calls.count() == 1
         && let Some(single) = calls.single()
     {
@@ -346,6 +421,7 @@ fn run_entry(key: RunKey, calls: &Summary) -> (AuditAction, AuthorizationProof, 
     }
     let action = AuditAction::HostCallRun {
         calls: calls.signed(),
+        actor: actor.cloned(),
     };
     match key {
         RunKey::Calls if calls.failed == 0 => (action, manifest_gated(), AuditOutcome::success()),
@@ -446,8 +522,9 @@ pub(super) struct Lanes {
     /// lane marker.
     unregistered: Vec<PrincipalId>,
     track_chains: bool,
-    /// Queued write-ahead admissions (host calls blocked on the writer).
-    admissions: usize,
+    /// Queued slots a caller waits for: write-ahead admissions and
+    /// committed records not yet answered.
+    awaited: usize,
     /// Where the lane run is in its life.
     pub(super) lifecycle: Lifecycle,
     /// Calls offered to the lanes (queued, folded or lost).
@@ -469,7 +546,7 @@ impl Lanes {
             pending_since: None,
             unregistered: Vec::new(),
             track_chains,
-            admissions: 0,
+            awaited: 0,
             lifecycle: Lifecycle::Open,
             accepted: 0,
             queued_calls: 0,
@@ -498,7 +575,9 @@ impl Lanes {
         });
     }
 
-    /// Queue one call behind everything already queued for its chain.
+    /// Queue one record behind everything already queued for its chain. A
+    /// host call may fold into the chain's tail run; any other record is its
+    /// own slot.
     pub(super) fn push_call(
         &mut self,
         principal: &PrincipalId,
@@ -511,6 +590,7 @@ impl Lanes {
         self.accepted = self.accepted.saturating_add(1);
         self.queued_calls = self.queued_calls.saturating_add(1);
         let full = self.queued_slots >= self.capacity;
+        let host_call = call.is_host_call();
         let key = call.run_key();
         match self
             .chains
@@ -520,8 +600,9 @@ impl Lanes {
         {
             Some(SlotKind::Run {
                 key: tail_key,
+                actor,
                 calls,
-            }) if *tail_key == key => {
+            }) if host_call && *tail_key == key && actor.as_ref() == call.action.actor() => {
                 calls.push(call);
                 return Pushed::Folded;
             },
@@ -532,15 +613,53 @@ impl Lanes {
             },
             _ => {},
         }
-        let calls = Summary::new(call);
         if full {
             self.queue_full = self.queue_full.saturating_add(1);
+            let calls = Summary::new(call);
             self.push_back(principal, SlotKind::Loss { calls }, now);
-            Pushed::Lost
-        } else {
-            self.push_back(principal, SlotKind::Run { key, calls }, now);
-            Pushed::Queued
+            return Pushed::Lost;
         }
+        let kind = if host_call {
+            SlotKind::Run {
+                key,
+                actor: call.action.actor().cloned(),
+                calls: Summary::new(call),
+            }
+        } else {
+            SlotKind::Record {
+                call: Box::new(call),
+                commit: None,
+            }
+        };
+        self.push_back(principal, kind, now);
+        Pushed::Queued
+    }
+
+    /// Queue a record the caller waits for as its own slot behind everything
+    /// already queued for its chain. Committed records are bounded by their
+    /// waiting callers, so they may exceed the queue capacity.
+    pub(super) fn push_commit(
+        &mut self,
+        principal: &PrincipalId,
+        call: Call,
+        commit: CommitSender,
+        now: Instant,
+    ) -> Pushed {
+        if self.lifecycle.refuses_calls() {
+            return Pushed::Closed;
+        }
+        self.accepted = self.accepted.saturating_add(1);
+        self.queued_calls = self.queued_calls.saturating_add(1);
+        self.awaited = self.awaited.saturating_add(1);
+        self.push_back(
+            principal,
+            SlotKind::Record {
+                call: Box::new(call),
+                commit: Some(commit),
+            },
+            now,
+        );
+        Pushed::Queued
     }
 
     /// Queue a write-ahead admission. Admissions are bounded by concurrent
@@ -555,7 +674,7 @@ impl Lanes {
         if self.lifecycle.refuses_calls() {
             return false;
         }
-        self.admissions = self.admissions.saturating_add(1);
+        self.awaited = self.awaited.saturating_add(1);
         self.push_back(principal, SlotKind::Admit { action, ticket }, now);
         true
     }
@@ -585,10 +704,11 @@ impl Lanes {
         self.pending_since
     }
 
-    /// Whether a host call is waiting on this queue (an admission or a
-    /// chain registration), so the writer should not wait for the window.
+    /// Whether a host call is waiting on this queue (an admission, a
+    /// committed record or a chain registration), so the writer should not
+    /// wait for the window.
     pub(super) fn urgent(&self) -> bool {
-        self.admissions > 0 || !self.unregistered.is_empty()
+        self.awaited > 0 || !self.unregistered.is_empty()
     }
 
     /// Chains to add to the lane marker before their first entry is written.
@@ -597,17 +717,18 @@ impl Lanes {
     }
 
     /// Remove up to `max` slots. Slots only ever leave from the front of
-    /// their chain's FIFO, so each chain keeps its order. Chains with a
-    /// waiting admission go first, up to and including the admission, so a
-    /// fail-closed call waits for its own chain's backlog only; the rest
-    /// leave in global queue order. Abandoned admissions are dropped.
+    /// their chain's FIFO, so each chain keeps its order. Chains with a slot
+    /// a caller waits for (an admission or a committed record) go first, up
+    /// to and including that slot, so the caller waits for its own chain's
+    /// backlog only; the rest leave in global queue order. Abandoned
+    /// admissions are dropped.
     pub(super) fn take(&mut self, max: usize, now: Instant) -> Vec<Slot> {
         let mut taken = Vec::new();
-        if self.admissions > 0 {
+        if self.awaited > 0 {
             let waiting: Vec<PrincipalId> = self
                 .chains
                 .iter()
-                .filter(|(_, lane)| lane.fifo.iter().any(Slot::is_admission))
+                .filter(|(_, lane)| lane.fifo.iter().any(Slot::is_awaited))
                 .map(|(principal, _)| principal.clone())
                 .collect();
             for principal in waiting {
@@ -615,7 +736,7 @@ impl Lanes {
                     && self
                         .chains
                         .get(&principal)
-                        .is_some_and(|lane| lane.fifo.iter().any(Slot::is_admission))
+                        .is_some_and(|lane| lane.fifo.iter().any(Slot::is_awaited))
                 {
                     self.take_front(&principal, &mut taken);
                 }
@@ -648,11 +769,13 @@ impl Lanes {
             return;
         };
         self.queued_slots = self.queued_slots.saturating_sub(1);
-        if let SlotKind::Admit { ticket, .. } = &slot.kind {
-            self.admissions = self.admissions.saturating_sub(1);
-            if ticket.is_abandoned() {
-                return;
-            }
+        if slot.is_awaited() {
+            self.awaited = self.awaited.saturating_sub(1);
+        }
+        if let SlotKind::Admit { ticket, .. } = &slot.kind
+            && ticket.is_abandoned()
+        {
+            return;
         }
         taken.push(slot);
     }
@@ -671,8 +794,20 @@ impl Lanes {
             });
         }
         self.queued_slots = self.queued_slots.saturating_sub(tickets.len());
-        self.admissions = self.admissions.saturating_sub(tickets.len());
+        self.awaited = self.awaited.saturating_sub(tickets.len());
         tickets
+    }
+
+    /// Take the senders of every queued committed record, for answering
+    /// their callers while the log is unavailable. The records stay queued
+    /// and are still written in their place.
+    pub(super) fn take_commits(&mut self) -> Vec<CommitSender> {
+        let mut senders = Vec::new();
+        for lane in self.chains.values_mut() {
+            senders.extend(lane.fifo.iter_mut().filter_map(Slot::take_commit));
+        }
+        self.awaited = self.awaited.saturating_sub(senders.len());
+        senders
     }
 }
 

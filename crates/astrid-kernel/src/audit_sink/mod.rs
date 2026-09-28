@@ -1,7 +1,8 @@
 //! Kernel implementation of the capsule host-audit sink.
 //!
 //! The WASM host engine (`astrid-capsule`) reports sensitive per-action host
-//! calls — fs read/write/delete, net connect/bind/accept, process spawn — to
+//! calls — fs read/write/delete, net connect/bind/accept, process spawn — and
+//! the records around them (HTTP exchanges, tool calls, approval decisions) to
 //! the [`HostAuditSink`](astrid_capsule::HostAuditSink) trait. The kernel
 //! holds both the durable audit log and the runtime ed25519 signing key, so
 //! it is the side that can map those neutral events onto a signed,
@@ -9,14 +10,24 @@
 //!
 //! # Ordered, loss-accounted lane
 //!
-//! A host call is placed in its principal chain's FIFO (see [`lane`]) and the
+//! A record is placed in its principal chain's FIFO (see [`lane`]) and the
 //! host call returns. A dedicated writer (see [`writer`]) appends the FIFO in
-//! order, so a chain's entries are in call order. Consecutive calls share one
-//! entry that counts them and commits to each of them through a fold
-//! ([`astrid_audit::host_call`]). A call that meets a full queue is counted
-//! in a signed loss entry at its place in the chain, and a lane run that
-//! stops without draining leaves a signed gap entry at the next start (see
-//! [`marker`]). Producers never block on the queue.
+//! order, so a chain's entries are in call order. Consecutive host calls of
+//! one capsule share one entry that counts them and commits to each of them
+//! through a fold ([`astrid_audit::host_call`]); a run never spans capsules,
+//! and every other record is its own entry. A record that meets a full queue
+//! is counted in a signed loss entry at its place in the chain, and a lane run
+//! that stops without draining leaves a signed gap entry at the next start
+//! (see [`marker`]). Producers never block on the queue.
+//!
+//! # Durable records
+//!
+//! [`HostAuditSink::commit`] (HTTP pre-commits and completions, answered
+//! approval prompts) queues its record at the tail of the same FIFO and waits
+//! until the entry is durable, so a committed record keeps its place in call
+//! order. HTTP requests are numbered per principal and lane run: the `run_id`
+//! of an HTTP entry is the lane run's epoch, which a gap entry names when that
+//! run stopped without draining.
 //!
 //! # Fail-closed classes
 //!
@@ -25,25 +36,30 @@
 //! runs; if it cannot be recorded, the call is refused and the refusal is
 //! recorded as a denial.
 
+mod coverage;
 mod lane;
 mod marker;
 mod writer;
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use astrid_audit::host_call::{HOST_CALL_CLASSES, HostCallOutcome};
-use astrid_audit::{AuditAction, AuditLog};
-use astrid_capsule::{HostAuditEvent, HostAuditOutcome, HostAuditRefusal, HostAuditSink};
+use astrid_audit::{AuditAction, AuditLog, CapsuleActor};
+use astrid_capsule::{
+    HostAuditActor, HostAuditEvent, HostAuditOutcome, HostAuditReceipt, HostAuditRefusal,
+    HostAuditSink,
+};
 use astrid_config::types::AuditConfig;
 use astrid_core::{PrincipalId, SessionId, Timestamp};
 use astrid_crypto::ContentHash;
 use astrid_storage::ScopedKvStore;
 use tracing::warn;
 
-use lane::{AdmitTicket, Call, Lanes, Lifecycle, Pushed};
+use lane::{AdmitTicket, Call, CommitSender, Lanes, Lifecycle, Pushed};
 use writer::{HealthState, Shared, WriterConfig};
 
 /// Authorization reason stamped on an allowed or failed manifest-gated host
@@ -68,6 +84,11 @@ const MAX_AUDIT_STR_BYTES: usize = 1024;
 
 /// How long a fail-closed host call waits for its write-ahead entry.
 const FAIL_CLOSED_WAIT: Duration = Duration::from_secs(10);
+
+/// How long [`HostAuditSink::commit`] waits for its entry before the caller
+/// continues without an entry id. The record stays queued and is written in
+/// its place once the log accepts it.
+const COMMIT_WAIT: Duration = Duration::from_secs(10);
 
 /// Operator policy for the host-audit writer. Built from [`AuditConfig`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,6 +130,7 @@ impl From<&AuditConfig> for HostAuditPolicy {
 
 impl HostAuditPolicy {
     /// Whether `event` must be admitted through a durable write-ahead entry.
+    /// Only host-call classes can fail closed.
     fn fails_closed(&self, event: &HostAuditEvent<'_>) -> bool {
         let index = match event {
             HostAuditEvent::FileRead { .. } => 0,
@@ -118,7 +140,12 @@ impl HostAuditPolicy {
             HostAuditEvent::NetBind { .. } => 4,
             HostAuditEvent::NetAccept { .. } => 5,
             HostAuditEvent::ProcessSpawn { .. } => 6,
-            HostAuditEvent::FileProbe { .. } => return false,
+            HostAuditEvent::FileProbe { .. }
+            | HostAuditEvent::HttpRequest(_)
+            | HostAuditEvent::HttpResponse(_)
+            | HostAuditEvent::ToolCall { .. }
+            | HostAuditEvent::ApprovalRequested { .. }
+            | HostAuditEvent::ApprovalDecided(_) => return false,
         };
         self.fail_closed & (1 << index) != 0
     }
@@ -127,17 +154,17 @@ impl HostAuditPolicy {
 /// Operator-visible health of the host-audit lane.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AuditSinkHealth {
-    /// Calls accepted by the lane (recorded, queued, or loss-accounted).
+    /// Records accepted by the lane (recorded, queued, or loss-accounted).
     pub accepted: u64,
-    /// Calls whose entry (single or run) is durable.
+    /// Records whose entry (single or run) is durable.
     pub persisted: u64,
-    /// Calls counted by durable loss entries instead of their own entry.
+    /// Records counted by durable loss entries instead of their own entry.
     pub lost: u64,
     /// Failed durable append attempts (each is retried).
     pub failed: u64,
-    /// Calls that met a full queue and went into a loss entry.
+    /// Records that met a full queue and went into a loss entry.
     pub queue_full: u64,
-    /// Calls accepted but not yet counted by a durable entry.
+    /// Records accepted but not yet counted by a durable entry.
     pub queue_depth: u64,
     /// Calls folded into a run entry after its first call.
     pub collapsed_repeats: u64,
@@ -148,7 +175,7 @@ pub struct AuditSinkHealth {
     /// Fail-closed calls refused because their write-ahead entry was not
     /// durable.
     pub fail_closed_refused: u64,
-    /// Calls reported after the writer stopped; they reach no entry.
+    /// Records reported after the writer stopped; they reach no entry.
     pub dropped_after_shutdown: u64,
     /// Whether the dedicated writer thread is alive.
     pub worker_alive: bool,
@@ -170,6 +197,7 @@ impl AuditQueue {
         session: SessionId,
         policy: HostAuditPolicy,
         marker: Option<ScopedKvStore>,
+        epoch: String,
     ) -> Arc<Self> {
         let shared = Arc::new(Shared {
             lanes: Mutex::new(Lanes::new(policy.queue_capacity, marker.is_some())),
@@ -181,6 +209,7 @@ impl AuditQueue {
             session,
             policy,
             marker,
+            epoch,
         };
         let worker_shared = Arc::clone(&shared);
         let worker = thread::Builder::new()
@@ -300,12 +329,26 @@ fn wait_blocking<T>(wait: impl FnOnce() -> T) -> T {
 /// chain.
 ///
 /// Moved into a `dyn HostAuditSink` handed to every capsule engine at load. One
-/// per kernel boot, bound to the kernel's single `session_id`.
+/// per kernel boot, bound to the kernel's single `session_id`. Every handle,
+/// the per-capsule ones from [`HostAuditSink::attributed`] included, shares
+/// one lane, so a principal's records from every capsule stay in call order.
 #[derive(Clone)]
 pub struct KernelAuditSink {
     /// Ordered lane and its writer. Producers never block on a full queue.
     queue: Arc<AuditQueue>,
     policy: HostAuditPolicy,
+    /// Capsule code identity stamped on every entry this handle writes.
+    /// `None` on the kernel's own handle; set on the per-capsule handles the
+    /// engine obtains through [`HostAuditSink::attributed`].
+    actor: Option<Arc<CapsuleActor>>,
+    /// Per-principal HTTP request numbers for this lane run, shared by every
+    /// handle so the sequence spans all capsules of a principal. Numbers are
+    /// taken under the lane lock, so they increase along the chain.
+    http_sequences: Arc<Mutex<HashMap<PrincipalId, u64>>>,
+    /// Identifier of this lane run (its epoch), recorded with every HTTP
+    /// entry. The sequences restart with each run, so a verifier checks for
+    /// gaps per run.
+    run_id: Arc<str>,
 }
 
 impl KernelAuditSink {
@@ -349,9 +392,13 @@ impl KernelAuditSink {
         policy: HostAuditPolicy,
         marker: Option<ScopedKvStore>,
     ) -> Self {
+        let epoch = uuid::Uuid::new_v4().to_string();
         Self {
-            queue: AuditQueue::new(audit_log, session_id, policy, marker),
+            run_id: Arc::from(epoch.as_str()),
+            queue: AuditQueue::new(audit_log, session_id, policy, marker, epoch),
             policy,
+            actor: None,
+            http_sequences: Arc::default(),
         }
     }
 
@@ -361,19 +408,24 @@ impl KernelAuditSink {
         self.queue.health()
     }
 
-    /// Stop the writer after draining every accepted call, then mark the
+    /// Stop the writer after draining every accepted record, then mark the
     /// lane run closed.
     pub fn shutdown(&self) {
         self.queue.shutdown();
     }
 
-    /// Map a neutral host event onto the internal audit action.
+    /// The capsule identity this handle stamps, if any.
+    fn actor(&self) -> Option<CapsuleActor> {
+        self.actor.as_deref().cloned()
+    }
+
+    /// Map a neutral host event onto the internal audit action, stamped with
+    /// `actor`.
     ///
-    /// `FileWrite` content hashing is not captured at this per-action seam
-    /// yet (the host fn reports the path, not the written bytes); a
-    /// zero hash is recorded as a documented placeholder pending a
-    /// content-addressed follow-up.
-    fn to_action(event: HostAuditEvent<'_>) -> AuditAction {
+    /// `FileWrite` carries the BLAKE3 of the written bytes when the host call
+    /// wrote content; a directory creation or a write denied before content
+    /// was accepted records the zero hash.
+    fn to_action(event: HostAuditEvent<'_>, actor: Option<CapsuleActor>) -> AuditAction {
         // Every guest-controlled string is bounded here (see
         // `truncate_guest_str` / `MAX_AUDIT_STR_BYTES`) before it is signed and
         // persisted, closing the disk/CPU amplification path.
@@ -381,25 +433,30 @@ impl KernelAuditSink {
             HostAuditEvent::FileRead { path } | HostAuditEvent::FileProbe { path } => {
                 AuditAction::FileRead {
                     path: truncate_guest_str(path),
+                    actor,
                 }
             },
-            HostAuditEvent::FileWrite { path } => AuditAction::FileWrite {
+            HostAuditEvent::FileWrite { path, content_hash } => AuditAction::FileWrite {
                 path: truncate_guest_str(path),
-                // Content hash not captured at the per-action seam yet.
-                content_hash: ContentHash::zero(),
+                content_hash: content_hash.unwrap_or_else(ContentHash::zero),
+                actor,
             },
             HostAuditEvent::FileDelete { path } => AuditAction::FileDelete {
                 path: truncate_guest_str(path),
+                actor,
             },
             HostAuditEvent::NetConnect { host, port } => AuditAction::NetConnect {
                 host: truncate_guest_str(host),
                 port,
+                actor,
             },
             HostAuditEvent::NetBind { addr } => AuditAction::NetBind {
                 addr: truncate_guest_str(addr),
+                actor,
             },
             HostAuditEvent::ProcessSpawn { command } => AuditAction::ProcessSpawn {
                 command: truncate_guest_str(command),
+                actor,
             },
             HostAuditEvent::NetAccept {
                 local_addr,
@@ -407,6 +464,28 @@ impl KernelAuditSink {
             } => AuditAction::NetAccept {
                 local_addr: truncate_guest_str(local_addr),
                 peer_addr: truncate_guest_str(peer_addr),
+                actor,
+            },
+            HostAuditEvent::HttpRequest(request) => coverage::http_request_action(&request, actor),
+            HostAuditEvent::HttpResponse(response) => {
+                coverage::http_response_action(&response, actor)
+            },
+            HostAuditEvent::ToolCall {
+                capsule_id,
+                tool,
+                call_id,
+                args_hash,
+                result_hash,
+            } => {
+                coverage::tool_call_action(capsule_id, tool, call_id, args_hash, result_hash, actor)
+            },
+            HostAuditEvent::ApprovalRequested {
+                request_id,
+                action,
+                resource,
+            } => coverage::approval_requested_action(request_id, action, resource, actor),
+            HostAuditEvent::ApprovalDecided(decision) => {
+                coverage::approval_decision_action(&decision, actor)
             },
         }
     }
@@ -422,13 +501,29 @@ impl KernelAuditSink {
         }
     }
 
-    /// Queue one call behind everything already queued for its chain.
-    fn enqueue(&self, principal: &PrincipalId, call: Call) {
-        let pushed = self
-            .queue
-            .shared
-            .lanes()
-            .push_call(principal, call, Instant::now());
+    /// Queue one record behind everything already queued for its chain.
+    ///
+    /// An HTTP request takes the next number of its principal's sequence in
+    /// the same critical section that queues it, so the numbers increase
+    /// along the chain. With `commit`, the record is its own entry and the
+    /// sender learns when it is durable. Returns how the record was queued
+    /// and the HTTP sequence number it took, if any.
+    fn enqueue(
+        &self,
+        principal: &PrincipalId,
+        mut call: Call,
+        commit: Option<CommitSender>,
+    ) -> (Pushed, Option<u64>) {
+        let (pushed, sequence) = {
+            let mut lanes = self.queue.shared.lanes();
+            let sequence = self.stamp_http_sequence(principal, &mut call.action);
+            let now = Instant::now();
+            let pushed = match commit {
+                Some(sender) => lanes.push_commit(principal, call, sender, now),
+                None => lanes.push_call(principal, call, now),
+            };
+            (pushed, sequence)
+        };
         match pushed {
             Pushed::Folded => {},
             Pushed::Queued | Pushed::Lost => self.queue.shared.wake.notify_one(),
@@ -444,6 +539,7 @@ impl KernelAuditSink {
                 );
             },
         }
+        (pushed, sequence)
     }
 
     fn record_at(
@@ -466,11 +562,12 @@ impl KernelAuditSink {
         self.enqueue(
             principal,
             Call {
-                action: Self::to_action(event),
+                action: Self::to_action(event, self.actor()),
                 outcome,
                 detail,
                 at,
             },
+            None,
         );
     }
 
@@ -516,7 +613,7 @@ impl HostAuditSink for KernelAuditSink {
         if !self.policy.fails_closed(&event) {
             return Ok(());
         }
-        let action = Self::to_action(event);
+        let action = Self::to_action(event, self.actor());
         let Err(reason) = self.admit_durably(principal, action.clone()) else {
             return Ok(());
         };
@@ -538,10 +635,35 @@ impl HostAuditSink for KernelAuditSink {
                 detail: truncate_guest_str(&format!("fail-closed audit unavailable: {reason}")),
                 at: Timestamp::now(),
             },
+            None,
         );
         Err(HostAuditRefusal::new(reason))
+    }
+
+    fn attributed(&self, actor: HostAuditActor) -> Option<Arc<dyn HostAuditSink>> {
+        Some(Arc::new(Self {
+            actor: Some(Arc::new(coverage::to_capsule_actor(&actor))),
+            ..self.clone()
+        }))
+    }
+
+    fn commit<'a>(
+        &'a self,
+        principal: &'a PrincipalId,
+        event: HostAuditEvent<'a>,
+        outcome: HostAuditOutcome<'a>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = HostAuditReceipt> + Send + 'a>> {
+        Box::pin(self.commit_in_order(principal, event, outcome))
     }
 }
 
 #[cfg(test)]
+mod attribution_tests;
+#[cfg(test)]
+mod http_tests;
+#[cfg(test)]
+mod lane_coverage_tests;
+#[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tool_approval_tests;

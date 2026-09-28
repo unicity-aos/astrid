@@ -12,6 +12,7 @@ fn read(path: &str, outcome: HostCallOutcome) -> Call {
     Call {
         action: AuditAction::FileRead {
             path: path.to_owned(),
+            actor: None,
         },
         outcome,
         detail: if outcome == HostCallOutcome::Ok {
@@ -27,6 +28,7 @@ fn describe(slot: &Slot) -> String {
     let kind = match &slot.kind {
         SlotKind::Run { .. } => "run",
         SlotKind::Loss { .. } => "loss",
+        SlotKind::Record { .. } => "record",
         SlotKind::Admit { .. } => "admit",
         SlotKind::Gap { .. } => "gap",
     };
@@ -212,7 +214,8 @@ fn abandoned_admission_is_dropped_before_it_is_written() {
     assert!(lanes.push_admit(
         &a,
         AuditAction::ProcessSpawn {
-            command: "rm".into()
+            command: "rm".into(),
+            actor: None,
         },
         Arc::clone(&ticket),
         now
@@ -258,6 +261,7 @@ fn chain_with_a_waiting_admission_is_taken_first() {
         &a,
         AuditAction::ProcessSpawn {
             command: "rm".into(),
+            actor: None,
         },
         Arc::new(AdmitTicket::new()),
         now,
